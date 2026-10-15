@@ -32,13 +32,17 @@ function fixture(t) {
   const object = new BridgeObject(ctx, env);
   env.BRIDGE = { getByName(name) { assert.equal(name, 'personal'); return object; } };
   const calls = [];
+  let slackCount = 0;
+  let lineCount = 0;
   t.mock.method(globalThis, 'fetch', async (url, options) => {
     calls.push({ url, body: JSON.parse(options.body), headers: options.headers });
     if (url === 'https://slack.com/api/chat.postMessage') {
-      return Response.json({ ok: true, channel: 'Cprivate', ts: '1792000000.000001' });
+      slackCount++;
+      return Response.json({ ok: true, channel: 'Cprivate', ts: '1792000000.' + String(slackCount).padStart(6, '0') });
     }
     assert.equal(url, 'https://api.line.me/v2/bot/message/push');
-    return Response.json({ sentMessages: [] });
+    const sentMessages = JSON.parse(options.body).messages.map(() => { lineCount++; return { id: 'line-sent-' + lineCount }; });
+    return Response.json({ sentMessages });
   });
   return { db, ctx, env, object, calls };
 }
@@ -127,14 +131,75 @@ test('LINE is acknowledged before delivery and duplicate events deliver once', a
   assert.equal(f.calls[0].headers.Authorization, 'Bearer test-user-token');
 });
 
-test('later LINE messages continue in the persisted Slack thread after restart', async t => {
+test('unquoted LINE messages always start separate Slack threads', async t => {
   const f = fixture(t);
   await establishSession(f);
+  await worker.fetch(signedLine(f.env, [lineEvent('second', '別件です')]), f.env);
+  await f.object.alarm();
+  assert.equal(Object.hasOwn(f.calls[1].body, 'thread_ts'), false);
+  await worker.fetch(signedSlack(f.env, slackEvent('first-reply')), f.env);
+  await f.object.alarm();
+  await worker.fetch(signedSlack(f.env, slackEvent('second-reply', '別件の回答', '1792000000.000002')), f.env);
+  await f.object.alarm();
+  assert.equal(f.calls.length, 4);
+  assert.equal(f.calls[2].body.messages[0].text, '回答です');
+  assert.equal(f.calls[3].body.messages[0].text, '別件の回答');
+});
+
+test('LINE quotes select the original thread after another thread and restart', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  await worker.fetch(signedSlack(f.env, slackEvent('first-reply')), f.env);
+  await f.object.alarm();
+  await worker.fetch(signedLine(f.env, [lineEvent('new-topic')]), f.env);
+  await f.object.alarm();
+  await worker.fetch(signedSlack(f.env, slackEvent('second-reply', '別件', '1792000000.000002')), f.env);
+  await f.object.alarm();
   const restarted = new BridgeObject(f.ctx, f.env);
   f.env.BRIDGE.getByName = () => restarted;
-  await worker.fetch(signedLine(f.env, [lineEvent('second', '続きです')]), f.env);
+  const firstQuote = lineEvent('quote-first', '最初の話の続き');
+  firstQuote.message.quotedMessageId = 'line-sent-1';
+  await worker.fetch(signedLine(f.env, [firstQuote]), f.env);
   await restarted.alarm();
-  assert.equal(f.calls[1].body.thread_ts, '1792000000.000001');
+  assert.equal(f.calls[4].body.thread_ts, '1792000000.000001');
+  const secondQuote = lineEvent('quote-second', '別件の続き');
+  secondQuote.message.quotedMessageId = 'line-sent-2';
+  await worker.fetch(signedLine(f.env, [secondQuote]), f.env);
+  await restarted.alarm();
+  assert.equal(f.calls[5].body.thread_ts, '1792000000.000002');
+  await worker.fetch(signedLine(f.env, [lineEvent('another-topic')]), f.env);
+  await restarted.alarm();
+  assert.equal(Object.hasOwn(f.calls[6].body, 'thread_ts'), false);
+});
+
+test('unknown LINE quotes fail explicitly without posting to a guessed thread', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  const event = lineEvent('unknown-quote');
+  event.message.quotedMessageId = 'unmapped-message';
+  await worker.fetch(signedLine(f.env, [event]), f.env);
+  await assert.rejects(async () => f.object.alarm(), /Unknown LINE quoted message: unmapped-message/);
+  assert.equal(f.calls.length, 1);
+  const [job] = f.db.prepare("SELECT status, error FROM jobs WHERE id = 'line:unknown-quote'").all();
+  assert.equal(job.status, 'failed');
+  assert.match(job.error, /unmapped-message/);
+});
+
+test('legacy thread stays eligible for Dots replies but normal sends start new threads', async t => {
+  const f = fixture(t);
+  f.db.exec("INSERT INTO session (id, thread) VALUES (1, 'legacy-thread')");
+  const restarted = new BridgeObject(f.ctx, f.env);
+  f.env.BRIDGE.getByName = () => restarted;
+  await worker.fetch(signedSlack(f.env, slackEvent('legacy-reply', '以前の会話の新しい回答', 'legacy-thread')), f.env);
+  await restarted.alarm();
+  assert.equal(f.calls[0].body.messages[0].text, '以前の会話の新しい回答');
+  const quote = lineEvent('legacy-quote'); quote.message.quotedMessageId = 'line-sent-1';
+  await worker.fetch(signedLine(f.env, [quote]), f.env);
+  await restarted.alarm();
+  assert.equal(f.calls[1].body.thread_ts, 'legacy-thread');
+  await worker.fetch(signedLine(f.env, [lineEvent('new-after-migration')]), f.env);
+  await restarted.alarm();
+  assert.equal(Object.hasOwn(f.calls[2].body, 'thread_ts'), false);
 });
 
 test('only Dots replies in the linked thread are forwarded, without loops', async t => {
@@ -171,6 +236,10 @@ test('long Unicode replies respect LINE limits without breaking characters', asy
   for (const batch of batches) assert.ok(batch.body.messages.length <= 5);
   for (const chunk of chunks) { assert.ok(chunk.length <= 5000); assert.equal(chunk.isWellFormed(), true); }
   assert.notEqual(batches[0].headers['X-Line-Retry-Key'], batches[1].headers['X-Line-Retry-Key']);
+  const quote = lineEvent('quote-later-chunk'); quote.message.quotedMessageId = 'line-sent-6';
+  await worker.fetch(signedLine(f.env, [quote]), f.env);
+  await f.object.alarm();
+  assert.equal(f.calls.at(-1).body.thread_ts, '1792000000.000001');
 });
 
 test('Slack API errors are persisted and surfaced without duplicate retries', async t => {
@@ -205,11 +274,18 @@ test('LINE API errors are persisted and surfaced', async t => {
 test('LINE retry conflict is accepted only with accepted-request-id', async t => {
   const f = fixture(t);
   await establishSession(f);
-  t.mock.method(globalThis, 'fetch', async () => Response.json({}, { status: 409, headers: { 'x-line-accepted-request-id': 'accepted' } }));
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ sentMessages: [{ id: 'already-sent' }] }, { status: 409, headers: { 'x-line-accepted-request-id': 'accepted' } }));
   await worker.fetch(signedSlack(f.env, slackEvent('accepted')), f.env);
   await f.object.alarm();
   const [job] = f.db.prepare("SELECT status FROM jobs WHERE id LIKE 'slack:%'").all();
   assert.equal(job.status, 'done');
+  const quote = lineEvent('accepted-quote'); quote.message.quotedMessageId = 'already-sent';
+  await worker.fetch(signedLine(f.env, [quote]), f.env);
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    assert.equal(JSON.parse(options.body).thread_ts, '1792000000.000001');
+    return Response.json({ ok: true, ts: '1792000000.000002' });
+  });
+  await f.object.alarm();
 });
 
 test('Dots reply arriving before Slack HTTP response is retained and delivered', async t => {
@@ -226,4 +302,21 @@ test('Dots reply arriving before Slack HTTP response is retained and delivered',
   await f.object.alarm();
   assert.equal(f.calls.length, 2);
   assert.equal(f.calls[1].body.messages[0].text, '回答です');
+});
+
+
+test('LINE accepted response must include every sent message id', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ sentMessages: [] }));
+  await worker.fetch(signedSlack(f.env, slackEvent('missing-ids')), f.env);
+  await assert.rejects(async () => f.object.alarm(), /LINE sentMessages/);
+});
+
+test('LINE 409 without accepted-request-id is an error', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ message: 'conflict' }, { status: 409 }));
+  await worker.fetch(signedSlack(f.env, slackEvent('unaccepted')), f.env);
+  await assert.rejects(async () => f.object.alarm(), /LINE HTTP 409/);
 });
