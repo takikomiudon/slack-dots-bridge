@@ -26,6 +26,8 @@ Dots側の対象はチャンネル `C0C94BHMQ7R`、投稿者 `U0CAE4018L8` の�
 2026年10月16日に、実際のLINEからの送信で確認しました。
 
 - LINE → Worker → Slackへの投稿成功
+- 通常送信のテストA・Bが別々のSlackスレッドとなり、それぞれDotsが自動返信
+- LINEでAのDots返信にリプライすると、Bを開始した後でもAスレッドへ戻り、`THREAD-A-CONTINUE-OK` のLINE返送まで成功
 - Dots側のイベント設定で自動起動し、約38秒後に「自動テストOK」と返信
 - Slack → Worker → LINEの返送成功（`delivery_done`）
 - 先行テストの「LINE接続OK」は、LINE端末での受信もユーザーが確認済み
