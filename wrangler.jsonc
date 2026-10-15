@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "line-dots-bridge",
+  "main": "src/index.js",
+  "account_id": "43815d3c33c48581993bbca7eec1fbe1",
+  "compatibility_date": "2026-10-16",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "vars": {
+    "SLACK_TEAM_ID": "T0C9HPM0NAJ",
+    "SLACK_CHANNEL_ID": "C0C94BHMQ7R",
+    "DOTS_USER_ID": "U0C9MMW5A65"
+  },
+  "durable_objects": { "bindings": [{ "name": "BRIDGE", "class_name": "BridgeObject" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BridgeObject"] }]
+}

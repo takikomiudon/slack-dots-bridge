@@ -211,3 +211,19 @@ test('LINE retry conflict is accepted only with accepted-request-id', async t =>
   const [job] = f.db.prepare("SELECT status FROM jobs WHERE id LIKE 'slack:%'").all();
   assert.equal(job.status, 'done');
 });
+
+test('Dots reply arriving before Slack HTTP response is retained and delivered', async t => {
+  const f = fixture(t);
+  const originalMock = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (url === 'https://slack.com/api/chat.postMessage') {
+      await worker.fetch(signedSlack(f.env, slackEvent('early')), f.env);
+    }
+    return originalMock(url, options);
+  });
+  await worker.fetch(signedLine(f.env, [lineEvent('race')]), f.env);
+  await f.object.alarm();
+  await f.object.alarm();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[1].body.messages[0].text, '回答です');
+});
