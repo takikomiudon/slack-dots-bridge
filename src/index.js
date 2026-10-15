@@ -73,6 +73,10 @@ export class BridgeObject {
     this.sql.exec('CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, retry_key TEXT NOT NULL, status TEXT NOT NULL, error TEXT NOT NULL, created INTEGER NOT NULL)');
     this.sql.exec('CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(status, created, id)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY CHECK(id = 1), thread TEXT NOT NULL)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS threads (thread TEXT PRIMARY KEY NOT NULL)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS line_messages (id TEXT PRIMARY KEY NOT NULL, thread TEXT NOT NULL)');
+    // Keep replies to the existing conversation eligible after upgrading from the single-thread version.
+    this.sql.exec('INSERT OR IGNORE INTO threads (thread) SELECT thread FROM session');
   }
 
   enqueue(id, kind, payload) {
@@ -86,7 +90,9 @@ export class BridgeObject {
         if (!Array.isArray(payload.events)) throw new Error('Invalid LINE events');
         for (const event of payload.events) {
           if (event.type !== 'message' || event.source.type !== 'user' || event.source.userId !== this.env.LINE_ALLOWED_USER_ID || event.message.type !== 'text') continue;
-          this.enqueue('line:' + requireText(event.webhookEventId, 'LINE webhookEventId'), 'slack', { text: requireText(event.message.text, 'LINE text') });
+          const message = { text: requireText(event.message.text, 'LINE text') };
+          if (Object.hasOwn(event.message, 'quotedMessageId')) message.quotedMessageId = requireText(event.message.quotedMessageId, 'LINE quotedMessageId');
+          this.enqueue('line:' + requireText(event.webhookEventId, 'LINE webhookEventId'), 'slack', message);
         }
       } else {
         if (payload.type !== 'event_callback' || payload.team_id !== this.env.SLACK_TEAM_ID) return;
@@ -130,8 +136,11 @@ export class BridgeObject {
     if (job.kind === 'slack') {
       const text = payload.text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
       const body = { channel: this.env.SLACK_CHANNEL_ID, text: '<@' + this.env.DOTS_USER_ID + '> ' + text };
-      const sessions = this.sql.exec('SELECT thread FROM session WHERE id = 1').toArray();
-      if (sessions.length > 0) body.thread_ts = sessions[0].thread;
+      if (Object.hasOwn(payload, 'quotedMessageId')) {
+        const messages = this.sql.exec('SELECT thread FROM line_messages WHERE id = ?', payload.quotedMessageId).toArray();
+        if (messages.length === 0) throw new Error('Unknown LINE quoted message: ' + payload.quotedMessageId);
+        body.thread_ts = messages[0].thread;
+      }
       const response = await fetch('https://slack.com/api/chat.postMessage', {
         method: 'POST', headers: { Authorization: 'Bearer ' + this.env.SLACK_USER_TOKEN, 'Content-Type': 'application/json; charset=utf-8' },
         body: JSON.stringify(body), signal: AbortSignal.timeout(15000),
@@ -140,18 +149,24 @@ export class BridgeObject {
       const result = await response.json();
       if (result.ok !== true) throw new Error('Slack API ' + requireText(result.error, 'Slack error'));
       requireText(result.ts, 'Slack message timestamp');
-      if (sessions.length === 0) this.sql.exec('INSERT INTO session (id, thread) VALUES (1, ?)', result.ts);
+      if (!Object.hasOwn(body, 'thread_ts')) this.sql.exec('INSERT OR IGNORE INTO threads (thread) VALUES (?)', result.ts);
       return;
     }
     if (job.kind !== 'line') throw new Error('Unknown delivery kind');
-    const sessions = this.sql.exec('SELECT thread FROM session WHERE id = 1').toArray();
-    if (sessions.length === 0 || payload.thread !== sessions[0].thread) return;
+    const threads = this.sql.exec('SELECT thread FROM threads WHERE thread = ?', payload.thread).toArray();
+    if (threads.length === 0) return;
     const response = await fetch('https://api.line.me/v2/bot/message/push', {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + this.env.LINE_CHANNEL_ACCESS_TOKEN, 'Content-Type': 'application/json', 'X-Line-Retry-Key': job.retry_key },
       body: JSON.stringify({ to: this.env.LINE_ALLOWED_USER_ID, messages: payload.messages }), signal: AbortSignal.timeout(15000),
     });
-    if (response.status === 409 && response.headers.has('x-line-accepted-request-id')) return;
-    if (!response.ok) throw new Error('LINE HTTP ' + response.status + ': ' + await response.text());
+    const acceptedRetry = response.status === 409 && response.headers.has('x-line-accepted-request-id');
+    if (!response.ok && !acceptedRetry) throw new Error('LINE HTTP ' + response.status + ': ' + await response.text());
+    const result = await response.json();
+    if (!Array.isArray(result.sentMessages) || result.sentMessages.length !== payload.messages.length) throw new Error('Invalid LINE sentMessages: expected one id per message');
+    const ids = result.sentMessages.map(message => requireText(message.id, 'LINE sentMessages id'));
+    this.ctx.storage.transactionSync(() => {
+      for (const id of ids) this.sql.exec('INSERT OR IGNORE INTO line_messages (id, thread) VALUES (?, ?)', id, payload.thread);
+    });
   }
 }
