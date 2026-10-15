@@ -30,7 +30,7 @@ Dots側の対象はチャンネル `C0C94BHMQ7R`、投稿者 `U0CAE4018L8` の�
 - Slack → Worker → LINEの返送成功（`delivery_done`）
 - 先行テストの「LINE接続OK」は、LINE端末での受信もユーザーが確認済み
 - 署名のない本番リクエストは401。LINE公式Webhook接続テストとSlack URL検証は成功
-- ローカルの自動テスト15件と構文チェックは成功
+- ローカルの自動テスト20件と構文チェックは成功（通常送信・引用返信・複数スレッド・再起動・旧データ移行を含む）
 
 ## ローカルでの検証と公開
 
@@ -63,7 +63,14 @@ npx wrangler secret bulk ../../work/line-dots.env
 
 ## 配信と障害の確認
 
-LINEとSlackの署名を検証し、受信イベントを永続キューに保存してから直ちに応答します。実際の配信はDurable ObjectのAlarmで処理します。同じイベントIDは重複送信しません。LINEの続きの発言は、初回に作ったSlackスレッドへ送信します。
+LINEとSlackの署名を検証し、受信イベントを永続キューに保存してから直ちに応答します。実際の配信はDurable ObjectのAlarmで処理します。同じイベントIDは重複送信しません。
+
+- LINEで通常送信：毎回、新しいSlackスレッドを作成します。
+- LINEでDotsのメッセージを長押しして［リプライ］：そのメッセージに対応するSlackスレッドへ送信します。別の会話を始めた後でも、元の会話を継続できます。
+
+LINE送信APIが返す `sentMessages[].id` とSlackスレッドを永続保存し、Webhookの `quotedMessageId` で返信先を照合します。どちらの検索も主キーを使います。長文を分割した場合も各メッセージIDを保存します。既存の単一スレッドは移行時に保持し、新しく届くDots返信をLINEへ返します。
+
+変更前にLINEへ送信済みのメッセージIDは保存されていないため、そこへの引用返信は対応先を特定できません。対応情報のない引用返信は `Unknown LINE quoted message` として配信失敗を記録し、Slackには投稿しません。変更後に届いたDotsの返信へリプライしてください。
 
 ```sh
 npx wrangler tail --format pretty
@@ -80,3 +87,5 @@ npx wrangler tail --format pretty
 - LINEの文字数上限を超える回答の分割
 
 画像・ファイル・音声・グループトーク、Slack上の既存返信の編集反映は対象外です。メッセージと配信状態はDurable Objectに保存されます。
+
+返信先の識別仕様は、LINE公式の[引用メッセージの受信](https://developers.line.biz/ja/docs/messaging-api/receiving-messages/#receive-quote-messages)と[送信時のメッセージID取得](https://developers.line.biz/ja/docs/messaging-api/get-quote-tokens/#get-quote-tokens-in-response)に基づいています。
