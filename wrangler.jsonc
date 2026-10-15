@@ -3,7 +3,7 @@
   "name": "line-dots-bridge",
   "main": "src/index.js",
   "account_id": "43815d3c33c48581993bbca7eec1fbe1",
-  "compatibility_date": "2026-10-16",
+  "compatibility_date": "2026-10-15",
   "workers_dev": true,
   "observability": { "enabled": true },
   "vars": {
