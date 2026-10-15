@@ -17,7 +17,20 @@ LINEチャネル `2012039161` のWebhookを有効にし、定型の応答メッ�
 
 Slackアプリ `line-dots-bridge`（`A0C9E19LY83`）は、User OAuthの `chat:write` と `groups:history` を使用します。Socket Modeを無効にし、`message.groups` の購読先を `/slack` に設定しています。権限自体は参加中のプライベートチャンネルに及びますが、中継コードは設定したチャンネル・DotsのユーザーID・スレッドだけを対象にします。
 
-User OAuth Tokenによる投稿には、本人のユーザーIDと中継アプリのBot IDが付くことを確認しています。Dotsがこの投稿に返信するかは、Webhookの接続成功とは別に確認が必要です。
+User OAuth Tokenによる投稿には、本人のユーザーIDと中継アプリのBot IDが付きます。通常のメンションだけではDotsに起動イベントが届かなかったため、Dots側にもイベント駆動の受信設定を登録・有効化しています。定期ポーリングは使いません。
+
+Dots側の対象はチャンネル `C0C94BHMQ7R`、投稿者 `U0CAE4018L8` の新規投稿とスレッド返信です。受信後にApp ID `A0C9E19LY83`、Bot ID `B0C9EV4RASH`、Dotsへのメンションを確認して同じスレッドへ返信します。中継のWebhook設定と、このDots側のイベント設定の両方が必要です。
+
+## 動作確認済み
+
+2026年10月16日に、実際のLINEからの送信で確認しました。
+
+- LINE → Worker → Slackへの投稿成功
+- Dots側のイベント設定で自動起動し、約38秒後に「自動テストOK」と返信
+- Slack → Worker → LINEの返送成功（`delivery_done`）
+- 先行テストの「LINE接続OK」は、LINE端末での受信もユーザーが確認済み
+- 署名のない本番リクエストは401。LINE公式Webhook接続テストとSlack URL検証は成功
+- ローカルの自動テスト15件と構文チェックは成功
 
 ## ローカルでの検証と公開
 
