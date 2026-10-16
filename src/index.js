@@ -1,6 +1,7 @@
 import { ConversationContext } from './context.js';
 import { classify, selectionMessage } from './routing.js';
 import { readImage, imageEvidence } from './images.js';
+import { slackText } from './slack-text.js';
 
 const encoder = new TextEncoder();
 const secretNames = ['SLACK_USER_TOKEN', 'SLACK_SIGNING_SECRET', 'LINE_CHANNEL_SECRET', 'LINE_CHANNEL_ACCESS_TOKEN', 'LINE_ALLOWED_USER_ID', 'SLACK_TEAM_ID', 'SLACK_CHANNEL_ID', 'SLACK_USER_ID', 'DOTS_USER_ID', 'OPENAI_API_KEY'];
@@ -189,7 +190,7 @@ export class BridgeObject {
         requireText(event.thread_ts, 'Dots reply thread');
         let status = 'queued';
         if (this.sql.exec('SELECT thread FROM threads WHERE thread = ?', event.thread_ts).toArray().length === 0) status = 'waiting_thread';
-        const batches = lineBatches(requireText(event.text, 'Dots reply text'));
+        const batches = lineBatches(requireText(slackText(event), 'Dots reply text'));
         for (let index = 0; index < batches.length; index++) {
           this.enqueue('slack:' + requireText(payload.event_id, 'Slack event_id') + ':' + index, 'line', { thread: event.thread_ts, messages: batches[index] }, status);
         }

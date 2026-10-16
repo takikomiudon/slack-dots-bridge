@@ -11,7 +11,7 @@ test('workerd transfers an image through a real Durable Object alarm', { timeout
   const calls = [];
   const mf = new Miniflare(convertV4MiniflareOptions({
     name: 'image-edge-test',
-    modules: ['index', 'context', 'routing', 'images'].map(name => ({ type: 'ESModule', path: new URL('../src/' + name + '.js', import.meta.url).pathname })),
+    modules: ['index', 'context', 'routing', 'images', 'slack-text'].map(name => ({ type: 'ESModule', path: new URL('../src/' + name + '.js', import.meta.url).pathname })),
     modulesRoot: new URL('../', import.meta.url).pathname,
     compatibilityDate: '2026-10-15',
     durableObjects: { BRIDGE: { className: 'BridgeObject', useSQLite: true } },
@@ -73,9 +73,12 @@ test('workerd transfers an image through a real Durable Object alarm', { timeout
     const response = await mf.dispatchFetch('https://bridge.test/slack', { method: 'POST', body: payload, headers: { 'x-slack-request-timestamp': timestamp, 'x-slack-signature': signature } });
     assert.equal(response.status, 200, await response.text());
   }
-  await sendSlack('edge-reply', { type: 'message', channel: 'private', user: 'dot', ts: '123.000002', thread_ts: '123.000001', text: '画像を確認しました' });
+  await sendSlack('edge-reply', {
+    type: 'message', channel: 'private', user: 'dot', ts: '123.000002', thread_ts: '123.000001', text: '画像を確認しました  続きです',
+    blocks: [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: '画像を確認しました\n\n続きです' }] }] }],
+  });
   await sendSlack('edge-file', { type: 'message', channel: 'private', user: 'owner', ts: '123.000001', files: [{ id: 'file' }] });
-  assert.deepEqual((await returned.promise).messages, [{ type: 'text', text: '画像を確認しました' }]);
+  assert.deepEqual((await returned.promise).messages, [{ type: 'text', text: '画像を確認しました\n\n続きです' }]);
   const followup = JSON.stringify({ events: [{ type: 'message', webhookEventId: 'image-followup', source: { type: 'user', userId: 'owner' }, message: { type: 'text', text: 'これを予定に入れて' } }] });
   assert.equal((await mf.dispatchFetch('https://bridge.test/line', { method: 'POST', body: followup, headers: { 'x-line-signature': createHmac('sha256', 'line-secret').update(followup).digest('base64') } })).status, 200);
   assert.equal((await routed.promise).thread_ts, '123.000001');
