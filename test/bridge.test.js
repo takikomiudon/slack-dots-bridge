@@ -354,6 +354,34 @@ test('only Dots replies in the linked thread are forwarded, without loops', asyn
   assert.match(f.calls[1].headers['X-Line-Retry-Key'], /^[a-f0-9-]{36}$/);
 });
 
+test('LINE receives visible Slack paragraphs and links instead of flattened notification text', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  const event = slackEvent('formatted-reply', '最初の段落。  次の段落。 <https://example.com|参考>');
+  event.event.blocks = [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [
+    { type: 'text', text: '最初の段落。' }, { type: 'text', text: '\n\n' },
+    { type: 'text', text: '次の段落。\n' }, { type: 'link', text: '参考', url: 'https://example.com' },
+  ] }] }];
+  await worker.fetch(signedSlack(f.env, event), f.env);
+  await f.object.alarm();
+  const expected = '最初の段落。\n\n次の段落。\n参考 (https://example.com)';
+  assert.equal(f.calls.at(-1).body.messages[0].text, expected);
+  const saved = f.db.prepare("SELECT content FROM routing_line WHERE id = 'sent:line-sent-1'").get();
+  assert.equal(JSON.parse(saved.content).text, expected);
+});
+
+test('rich Slack replies retain newlines across LINE Unicode message limits', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  const expected = '😀'.repeat(2499) + '\n\n' + '次の段落';
+  const event = slackEvent('formatted-long', '通知用本文');
+  event.event.blocks = [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: expected }] }] }];
+  await worker.fetch(signedSlack(f.env, event), f.env);
+  await f.object.alarm();
+  assert.equal(f.calls.at(-1).body.messages.map(message => message.text).join(''), expected);
+  assert.ok(f.calls.at(-1).body.messages.every(message => message.text.length <= 5000 && message.text.isWellFormed()));
+});
+
 test('long Unicode replies respect LINE limits without breaking characters', async t => {
   const f = fixture(t);
   await establishSession(f);
