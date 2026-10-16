@@ -9,6 +9,30 @@ function sample(name, lastThread, lastText, incoming, expected) {
 }
 
 export const routingCases = [
+  {
+    name: 'same operation different named project', expected: 'NEW',
+    context: {
+      candidates: [{ thread: 'project-a', messages: [{ role: 'user', text: '自動振り分けの接続テストです。架空の企画「瑠璃色の紙飛行機展」の話を始めます。実作業や設定変更はせず、ROUTING-A-OKとだけ返信してください。', images: [] }] }],
+      lineHistory: [{ role: 'user', thread: 'project-a', text: '自動振り分けの接続テストです。架空の企画「瑠璃色の紙飛行機展」の話を始めます。実作業や設定変更はせず、ROUTING-A-OKとだけ返信してください。' }],
+      incoming: { text: '自動振り分けの接続テストです。架空の企画「琥珀色の深海図書館」という別の話を始めます。実作業や設定変更はせず、ROUTING-B-OKとだけ返信してください。', images: [] },
+    },
+  },
+  {
+    name: 'renaming an existing project', expected: 'project-a',
+    context: {
+      candidates: [{ thread: 'project-a', messages: [{ role: 'user', text: '架空の企画「瑠璃色の紙飛行機展」の案を考えてください。', images: [] }] }],
+      lineHistory: [{ role: 'assistant', thread: 'project-a', text: '瑠璃色の紙飛行機展の案です。' }],
+      incoming: { text: 'その企画の名前を「琥珀色の深海図書館」に変更して', images: [] },
+    },
+  },
+  {
+    name: 'explicit new conversation despite shared topic', expected: 'NEW',
+    context: {
+      candidates: [{ thread: 'project-a', messages: [{ role: 'user', text: '紙飛行機の展示会の案を考えてください。', images: [] }] }],
+      lineHistory: [{ role: 'assistant', thread: 'project-a', text: '紙飛行機の展示会の案です。' }],
+      incoming: { text: 'ここから新しい話です。別の紙飛行機展示会について相談したいです。', images: [] },
+    },
+  },
   sample('implicit movie reminder', 'movie-a', '木場の映画の予定を登録しました。', '開始30分前に通知して', 'movie-a'),
   sample('short essay continuation', 'essay-a', 'A社の自己PRの修正案です。', 'もっと短くして', 'essay-a'),
   sample('return to older movie', 'essay-a', 'A社の自己PRの修正案です。', '木場の映画の予定を取り消して', 'movie-a'),
