@@ -40,7 +40,7 @@ test('invalid choices, refusals and malformed answers fail without guessing', as
     { type: 'refusal', name: 'thread' },
     { type: 'choice', name: 'wrong-question', choice: 'NEW', confidence: 1 },
   ]) {
-    t.mock.method(globalThis, 'fetch', async () => Response.json({ answers: [answer] }));
+    t.mock.method(globalThis, 'fetch', async () => Response.json({ answers: [answer] }, { headers: { 'x-request-id': 'req_invalid' } }));
     await assert.rejects(() => classify({ OPENAI_API_KEY: 'secret' }, context, []), /Invalid Decisions answer/);
   }
 });
