@@ -191,7 +191,7 @@ export class BridgeObject {
     if (upload.origin !== 'https://files.slack.com' || !upload.pathname.startsWith('/upload/') || upload.username !== '' || upload.password !== '') throw new Error('Invalid Slack upload URL');
     const uploaded = await fetch(upload.href, {
       method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: bytes,
-      signal: AbortSignal.timeout(30000), redirect: 'error',
+      signal: AbortSignal.timeout(30000), redirect: 'manual',
     });
     if (uploaded.status !== 200) throw new Error('Slack image upload HTTP ' + uploaded.status);
     await uploaded.text();
