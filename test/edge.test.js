@@ -6,6 +6,7 @@ import { Miniflare, Response, convertV4MiniflareOptions } from 'miniflare';
 test('workerd transfers an image through a real Durable Object alarm', { timeout: 20000 }, async t => {
   const shared = Promise.withResolvers();
   const returned = Promise.withResolvers();
+  const routed = Promise.withResolvers();
   const bytes = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
   const calls = [];
   const mf = new Miniflare(convertV4MiniflareOptions({
@@ -40,6 +41,20 @@ test('workerd transfers an image through a real Durable Object alarm', { timeout
         shared.resolve(body);
         return Response.json({ ok: true, files: [{ id: 'file' }] });
       }
+      if (path === '/api/files.info') return Response.json({ ok: true, file: { id: 'file', name: 'image.png', mimetype: 'image/png', url_private_download: 'https://files.slack.com/files-pri/T-file/image.png' } });
+      if (path === '/files-pri/T-file/image.png') return new Response(bytes, { headers: { 'Content-Type': 'image/png' } });
+      if (path === '/v1/decisions') {
+        assert.equal(request.headers.get('Authorization'), 'Bearer openai-test-token');
+        const body = await request.json();
+        assert.ok(body.input[0].content.some(part => part.type === 'input_image' && part.image_url.startsWith('data:image/png;base64,')));
+        return Response.json({ answers: [{ name: 'thread', type: 'choice', choice: '123.000001', confidence: 0.97 }] }, { headers: { 'x-request-id': 'req_edge' } });
+      }
+      if (path === '/api/chat.postMessage') {
+        const body = await request.json();
+        assert.deepEqual(body, { channel: 'private', text: '<@dot> これを予定に入れて', thread_ts: '123.000001' });
+        routed.resolve(body);
+        return Response.json({ ok: true, ts: '123.000003' });
+      }
       assert.equal(path, '/v2/bot/message/push');
       returned.resolve(await request.json());
       return Response.json({ sentMessages: [{ id: 'line-reply' }] });
@@ -61,4 +76,7 @@ test('workerd transfers an image through a real Durable Object alarm', { timeout
   await sendSlack('edge-reply', { type: 'message', channel: 'private', user: 'dot', ts: '123.000002', thread_ts: '123.000001', text: '画像を確認しました' });
   await sendSlack('edge-file', { type: 'message', channel: 'private', user: 'owner', ts: '123.000001', files: [{ id: 'file' }] });
   assert.deepEqual((await returned.promise).messages, [{ type: 'text', text: '画像を確認しました' }]);
+  const followup = JSON.stringify({ events: [{ type: 'message', webhookEventId: 'image-followup', source: { type: 'user', userId: 'owner' }, message: { type: 'text', text: 'これを予定に入れて' } }] });
+  assert.equal((await mf.dispatchFetch('https://bridge.test/line', { method: 'POST', body: followup, headers: { 'x-line-signature': createHmac('sha256', 'line-secret').update(followup).digest('base64') } })).status, 200);
+  assert.equal((await routed.promise).thread_ts, '123.000001');
 });

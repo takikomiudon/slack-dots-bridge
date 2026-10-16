@@ -9,6 +9,7 @@
   "vars": {
     "SLACK_TEAM_ID": "T0C9HPM0NAJ",
     "SLACK_CHANNEL_ID": "C0C94BHMQ7R",
+    "SLACK_USER_ID": "U0CAE4018L8",
     "DOTS_USER_ID": "U0C9MMW5A65"
   },
   "durable_objects": { "bindings": [{ "name": "BRIDGE", "class_name": "BridgeObject" }] },
