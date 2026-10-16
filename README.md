@@ -88,7 +88,9 @@ LINEに送ったJPEG・PNG・GIF・WebP画像を、元のバイト列のままSl
 
 通常の画像送信は新しいSlackスレッドを作ります。添付を共有し終えてから同じスレッドでDotsをメンションするため、添付前にDotsが起動する順序にはしません。Dotsの返信は既存の仕組みでLINEへ返します。複数枚を送った場合は1枚ずつ別のスレッドになります。
 
-2026年10月16日にSlack CLIで認証し、既存マニフェストにUser OAuth権限 `files:write` を追加しました。CLIと同じ再インストールAPIで反映し、本人のユーザーID・ワークスペースIDと、発行されたユーザートークンの権限を `auth.test` で確認済みです。更新したトークンをWorker Secretsへ登録し、画像対応版 `db7897a6-475e-4fe4-aa79-5dc2992608bf` を公開しました。実際のLINE画像に対するDotsの認識結果は確認待ちです。
+2026年10月16日にSlack CLIで認証し、既存マニフェストにUser OAuth権限 `files:write` を追加しました。CLIと同じ再インストールAPIで反映し、本人のユーザーID・ワークスペースIDと、発行されたユーザートークンの権限を `auth.test` で確認済みです。更新したトークンをWorker Secretsへ登録しています。
+
+初回の実画像送信は、Slackの `files.getUploadURLExternal` がJSON本文の `filename`・`length` を未指定として扱い、`invalid_arguments` で失敗しました。フォーム形式で成功することを実APIで確認し、形式を検証する回帰テストを追加して修正しました。添付確定APIはJSON形式で受理されることを確認済みです。修正版 `00345cfa-9c87-4dd1-bb06-3d029763e8a8` を公開し、実際のLINE画像に対するDotsの認識結果は再確認待ちです。
 
 ファイルを公開URLに変換する処理はありません。LINE上の保存期限切れ、サイズ上限超過、権限不足などは `delivery_failed` と原因を記録します。
 
