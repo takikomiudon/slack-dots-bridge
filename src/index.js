@@ -75,12 +75,18 @@ export class BridgeObject {
     this.sql.exec('CREATE TABLE IF NOT EXISTS session (id INTEGER PRIMARY KEY CHECK(id = 1), thread TEXT NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS threads (thread TEXT PRIMARY KEY NOT NULL)');
     this.sql.exec('CREATE TABLE IF NOT EXISTS line_messages (id TEXT PRIMARY KEY NOT NULL, thread TEXT NOT NULL)');
+    this.sql.exec('CREATE TABLE IF NOT EXISTS pending_image_roots (file_id TEXT PRIMARY KEY NOT NULL)');
     // Keep replies to the existing conversation eligible after upgrading from the single-thread version.
     this.sql.exec('INSERT OR IGNORE INTO threads (thread) SELECT thread FROM session');
   }
 
-  enqueue(id, kind, payload) {
-    this.sql.exec("INSERT OR IGNORE INTO jobs (id, kind, payload, retry_key, status, error, created) VALUES (?, ?, ?, ?, 'queued', '', ?)", id, kind, JSON.stringify(payload), crypto.randomUUID(), Date.now());
+  enqueue(id, kind, payload, status = 'queued') {
+    this.sql.exec("INSERT OR IGNORE INTO jobs (id, kind, payload, retry_key, status, error, created) VALUES (?, ?, ?, ?, ?, '', ?)", id, kind, JSON.stringify(payload), crypto.randomUUID(), status, Date.now());
+  }
+
+  registerThread(thread) {
+    this.sql.exec('INSERT OR IGNORE INTO threads (thread) VALUES (?)', thread);
+    this.sql.exec("UPDATE jobs SET status = 'queued' WHERE status = 'waiting_thread' AND json_extract(payload, '$.thread') = ?", thread);
   }
 
   async fetch(request) {
@@ -100,7 +106,7 @@ export class BridgeObject {
             const imageId = requireText(event.message.id, 'LINE image id');
             if (!/^\d+$/.test(imageId)) throw new Error('Invalid LINE image id');
             kind = 'slack_image';
-            message = { imageId, text: 'この画像の内容を確認してください。' };
+            message = { imageId, text: '' };
           } else continue;
           if (Object.hasOwn(event.message, 'quotedMessageId')) message.quotedMessageId = requireText(event.message.quotedMessageId, 'LINE quotedMessageId');
           this.enqueue('line:' + requireText(event.webhookEventId, 'LINE webhookEventId'), kind, message);
@@ -108,12 +114,26 @@ export class BridgeObject {
       } else {
         if (payload.type !== 'event_callback' || payload.team_id !== this.env.SLACK_TEAM_ID) return;
         const event = payload.event;
-        if (event.type !== 'message' || event.channel !== this.env.SLACK_CHANNEL_ID || event.user !== this.env.DOTS_USER_ID) return;
+        if (event.type !== 'message' || event.channel !== this.env.SLACK_CHANNEL_ID) return;
+        // File completion returns no thread timestamp; match the signed share event by the exact file ID.
+        if (Array.isArray(event.files)) {
+          for (const file of event.files) {
+            const pending = this.sql.exec('SELECT file_id FROM pending_image_roots WHERE file_id = ?', requireText(file.id, 'Slack shared file id')).toArray();
+            if (pending.length === 0) continue;
+            const thread = requireText(event.ts, 'Slack image root timestamp');
+            if (Object.hasOwn(event, 'thread_ts') && event.thread_ts !== thread) throw new Error('Unexpected threaded image root');
+            this.registerThread(thread);
+            this.sql.exec('DELETE FROM pending_image_roots WHERE file_id = ?', file.id);
+          }
+        }
+        if (event.user !== this.env.DOTS_USER_ID) return;
         if (Object.hasOwn(event, 'subtype') && event.subtype !== 'bot_message') return;
         requireText(event.thread_ts, 'Dots reply thread');
+        let status = 'queued';
+        if (this.sql.exec('SELECT thread FROM threads WHERE thread = ?', event.thread_ts).toArray().length === 0) status = 'waiting_thread';
         const batches = lineBatches(requireText(event.text, 'Dots reply text'));
         for (let index = 0; index < batches.length; index++) {
-          this.enqueue('slack:' + requireText(payload.event_id, 'Slack event_id') + ':' + index, 'line', { thread: event.thread_ts, messages: batches[index] });
+          this.enqueue('slack:' + requireText(payload.event_id, 'Slack event_id') + ':' + index, 'line', { thread: event.thread_ts, messages: batches[index] }, status);
         }
       }
     });
@@ -195,25 +215,19 @@ export class BridgeObject {
     });
     if (uploaded.status !== 200) throw new Error('Slack image upload HTTP ' + uploaded.status);
     await uploaded.text();
-    if (!Object.hasOwn(message, 'thread_ts')) {
-      const root = await this.slackApi('chat.postMessage', { channel: this.env.SLACK_CHANNEL_ID, text: '画像' });
-      message.thread_ts = requireText(root.ts, 'Slack image thread timestamp');
-      this.sql.exec('INSERT OR IGNORE INTO threads (thread) VALUES (?)', message.thread_ts);
-    }
-    const shared = await this.slackApi('files.completeUploadExternal', {
-      files: [{ id: fileId }], channel_id: this.env.SLACK_CHANNEL_ID, thread_ts: message.thread_ts,
-    });
+    const share = { files: [{ id: fileId }], channel_id: this.env.SLACK_CHANNEL_ID, initial_comment: message.text };
+    if (Object.hasOwn(message, 'thread_ts')) share.thread_ts = message.thread_ts;
+    else this.sql.exec('INSERT INTO pending_image_roots (file_id) VALUES (?)', fileId);
+    const shared = await this.slackApi('files.completeUploadExternal', share);
     if (!Array.isArray(shared.files) || shared.files.length !== 1 || shared.files[0].id !== fileId) throw new Error('Invalid Slack completed file');
-    // Mention only after the file is shared so Dots can read the attachment when it wakes.
-    const posted = await this.slackApi('chat.postMessage', message);
-    requireText(posted.ts, 'Slack image mention timestamp');
   }
 
   async deliver(job) {
     const payload = JSON.parse(job.payload);
     if (job.kind === 'slack' || job.kind === 'slack_image') {
       const text = payload.text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-      const body = { channel: this.env.SLACK_CHANNEL_ID, text: '<@' + this.env.DOTS_USER_ID + '> ' + text };
+      const body = { channel: this.env.SLACK_CHANNEL_ID, text: '<@' + this.env.DOTS_USER_ID + '>' };
+      if (text.length > 0) body.text += ' ' + text;
       if (Object.hasOwn(payload, 'quotedMessageId')) {
         const messages = this.sql.exec('SELECT thread FROM line_messages WHERE id = ?', payload.quotedMessageId).toArray();
         if (messages.length === 0) throw new Error('Unknown LINE quoted message: ' + payload.quotedMessageId);
@@ -231,7 +245,7 @@ export class BridgeObject {
       const result = await response.json();
       if (result.ok !== true) throw new Error('Slack API ' + requireText(result.error, 'Slack error'));
       requireText(result.ts, 'Slack message timestamp');
-      if (!Object.hasOwn(body, 'thread_ts')) this.sql.exec('INSERT OR IGNORE INTO threads (thread) VALUES (?)', result.ts);
+      if (!Object.hasOwn(body, 'thread_ts')) this.registerThread(result.ts);
       return;
     }
     if (job.kind !== 'line') throw new Error('Unknown delivery kind');

@@ -4,7 +4,7 @@ import test from 'node:test';
 import { Miniflare, Response, convertV4MiniflareOptions } from 'miniflare';
 
 test('workerd transfers an image through a real Durable Object alarm', { timeout: 20000 }, async t => {
-  const mentioned = Promise.withResolvers();
+  const shared = Promise.withResolvers();
   const returned = Promise.withResolvers();
   const bytes = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
   const calls = [];
@@ -33,13 +33,10 @@ test('workerd transfers an image through a real Durable Object alarm', { timeout
         return new Response();
       }
       if (path === '/api/files.completeUploadExternal') {
-        assert.deepEqual(await request.json(), { files: [{ id: 'file' }], channel_id: 'private', thread_ts: '123.000001' });
-        return Response.json({ ok: true, files: [{ id: 'file' }] });
-      }
-      if (path === '/api/chat.postMessage') {
         const body = await request.json();
-        if (body.text.includes('<@dot>')) mentioned.resolve(body);
-        return Response.json({ ok: true, ts: '123.000001' });
+        assert.deepEqual(body, { files: [{ id: 'file' }], channel_id: 'private', initial_comment: '<@dot>' });
+        shared.resolve(body);
+        return Response.json({ ok: true, files: [{ id: 'file' }] });
       }
       assert.equal(path, '/v2/bot/message/push');
       returned.resolve(await request.json());
@@ -50,11 +47,15 @@ test('workerd transfers an image through a real Durable Object alarm', { timeout
   const body = JSON.stringify({ events: [{ type: 'message', webhookEventId: 'edge-image', source: { type: 'user', userId: 'owner' }, message: { type: 'image', id: '123', contentProvider: { type: 'line' } } }] });
   const response = await mf.dispatchFetch('https://bridge.test/line', { method: 'POST', body, headers: { 'x-line-signature': createHmac('sha256', 'line-secret').update(body).digest('base64') } });
   assert.equal(response.status, 200);
-  assert.equal((await mentioned.promise).thread_ts, '123.000001');
-  assert.deepEqual(calls, ['/v2/bot/message/123/content', '/api/files.getUploadURLExternal', '/upload/v1/edge', '/api/chat.postMessage', '/api/files.completeUploadExternal', '/api/chat.postMessage']);
-  const reply = JSON.stringify({ type: 'event_callback', team_id: 'team', event_id: 'edge-reply', event: { type: 'message', channel: 'private', user: 'dot', thread_ts: '123.000001', text: '画像を確認しました' } });
-  const timestamp = String(Math.floor(Date.now() / 1000));
-  const signature = 'v0=' + createHmac('sha256', 'slack-secret').update('v0:' + timestamp + ':' + reply).digest('hex');
-  assert.equal((await mf.dispatchFetch('https://bridge.test/slack', { method: 'POST', body: reply, headers: { 'x-slack-request-timestamp': timestamp, 'x-slack-signature': signature } })).status, 200);
+  assert.equal((await shared.promise).initial_comment, '<@dot>');
+  assert.deepEqual(calls, ['/v2/bot/message/123/content', '/api/files.getUploadURLExternal', '/upload/v1/edge', '/api/files.completeUploadExternal']);
+  async function sendSlack(id, event) {
+    const payload = JSON.stringify({ type: 'event_callback', team_id: 'team', event_id: id, event });
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const signature = 'v0=' + createHmac('sha256', 'slack-secret').update('v0:' + timestamp + ':' + payload).digest('hex');
+    assert.equal((await mf.dispatchFetch('https://bridge.test/slack', { method: 'POST', body: payload, headers: { 'x-slack-request-timestamp': timestamp, 'x-slack-signature': signature } })).status, 200);
+  }
+  await sendSlack('edge-reply', { type: 'message', channel: 'private', user: 'dot', thread_ts: '123.000001', text: '画像を確認しました' });
+  await sendSlack('edge-file', { type: 'message', channel: 'private', user: 'owner', ts: '123.000001', files: [{ id: 'file' }] });
   assert.deepEqual((await returned.promise).messages, [{ type: 'text', text: '画像を確認しました' }]);
 });
