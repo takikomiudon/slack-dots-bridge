@@ -143,9 +143,15 @@ export class BridgeObject {
   }
 
   async slackApi(method, body) {
+    let contentType = 'application/json; charset=utf-8';
+    let encoded;
+    if (body instanceof URLSearchParams) {
+      contentType = 'application/x-www-form-urlencoded';
+      encoded = body.toString();
+    } else encoded = JSON.stringify(body);
     const response = await fetch('https://slack.com/api/' + method, {
-      method: 'POST', headers: { Authorization: 'Bearer ' + this.env.SLACK_USER_TOKEN, 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify(body), signal: AbortSignal.timeout(30000),
+      method: 'POST', headers: { Authorization: 'Bearer ' + this.env.SLACK_USER_TOKEN, 'Content-Type': contentType },
+      body: encoded, signal: AbortSignal.timeout(30000),
     });
     if (!response.ok) throw new Error('Slack ' + method + ' HTTP ' + response.status);
     const result = await response.json();
@@ -179,7 +185,7 @@ export class BridgeObject {
     const bytes = new Uint8Array(size);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    const grant = await this.slackApi('files.getUploadURLExternal', { filename: 'line-image-' + payload.imageId + '.' + extensions[mime], length: size });
+    const grant = await this.slackApi('files.getUploadURLExternal', new URLSearchParams({ filename: 'line-image-' + payload.imageId + '.' + extensions[mime], length: String(size) }));
     const fileId = requireText(grant.file_id, 'Slack upload file id');
     const upload = new URL(requireText(grant.upload_url, 'Slack upload URL'));
     if (upload.origin !== 'https://files.slack.com' || !upload.pathname.startsWith('/upload/') || upload.username !== '' || upload.password !== '') throw new Error('Invalid Slack upload URL');
