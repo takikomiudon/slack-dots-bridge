@@ -9,12 +9,14 @@ test('workerd transfers an image through a real Durable Object alarm', { timeout
   const bytes = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
   const calls = [];
   const mf = new Miniflare(convertV4MiniflareOptions({
-    name: 'image-edge-test', modules: true,
-    scriptPath: new URL('../src/index.js', import.meta.url).pathname,
+    name: 'image-edge-test',
+    modules: ['index', 'context', 'routing', 'images'].map(name => ({ type: 'ESModule', path: new URL('../src/' + name + '.js', import.meta.url).pathname })),
+    modulesRoot: new URL('../', import.meta.url).pathname,
     compatibilityDate: '2026-10-15',
     durableObjects: { BRIDGE: { className: 'BridgeObject', useSQLite: true } },
     bindings: {
       SLACK_USER_TOKEN: 'slack-token', SLACK_SIGNING_SECRET: 'slack-secret',
+      SLACK_USER_ID: 'owner', OPENAI_API_KEY: 'openai-test-token',
       LINE_CHANNEL_SECRET: 'line-secret', LINE_CHANNEL_ACCESS_TOKEN: 'line-token',
       LINE_ALLOWED_USER_ID: 'owner', SLACK_TEAM_ID: 'team', SLACK_CHANNEL_ID: 'private', DOTS_USER_ID: 'dot',
     },
@@ -53,9 +55,10 @@ test('workerd transfers an image through a real Durable Object alarm', { timeout
     const payload = JSON.stringify({ type: 'event_callback', team_id: 'team', event_id: id, event });
     const timestamp = String(Math.floor(Date.now() / 1000));
     const signature = 'v0=' + createHmac('sha256', 'slack-secret').update('v0:' + timestamp + ':' + payload).digest('hex');
-    assert.equal((await mf.dispatchFetch('https://bridge.test/slack', { method: 'POST', body: payload, headers: { 'x-slack-request-timestamp': timestamp, 'x-slack-signature': signature } })).status, 200);
+    const response = await mf.dispatchFetch('https://bridge.test/slack', { method: 'POST', body: payload, headers: { 'x-slack-request-timestamp': timestamp, 'x-slack-signature': signature } });
+    assert.equal(response.status, 200, await response.text());
   }
-  await sendSlack('edge-reply', { type: 'message', channel: 'private', user: 'dot', thread_ts: '123.000001', text: '画像を確認しました' });
+  await sendSlack('edge-reply', { type: 'message', channel: 'private', user: 'dot', ts: '123.000002', thread_ts: '123.000001', text: '画像を確認しました' });
   await sendSlack('edge-file', { type: 'message', channel: 'private', user: 'owner', ts: '123.000001', files: [{ id: 'file' }] });
   assert.deepEqual((await returned.promise).messages, [{ type: 'text', text: '画像を確認しました' }]);
 });

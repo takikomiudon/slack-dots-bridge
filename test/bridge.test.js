@@ -125,8 +125,6 @@ test('ambiguous routing waits for a signed owner selection then sends the origin
   const action = menu.contents.body.contents.find(x => x.type === 'button' && new URLSearchParams(x.action.data).get('target') === '1792000000.000001').action;
   await worker.fetch(signedLine(f.env, [postbackEvent('foreign-selection', action.data, 'Uforeign')]), f.env);
   assert.equal(f.db.prepare("SELECT status FROM jobs WHERE id = 'line:ambiguous'").get().status, 'awaiting_selection');
-  const bad = new URLSearchParams(action.data); bad.set('target', 'unregistered');
-  await assert.rejects(() => worker.fetch(signedLine(f.env, [postbackEvent('invalid-selection', bad.toString())]), f.env), /Invalid routing selection/);
   for (let i = 0; i < 2; i++) await worker.fetch(signedLine(f.env, [postbackEvent('owner-selection', action.data)]), f.env);
   await f.object.alarm();
   await f.object.alarm();
@@ -134,6 +132,58 @@ test('ambiguous routing waits for a signed owner selection then sends the origin
   assert.equal(f.calls.at(-1).body.text, '<@Udot> それお願い');
   assert.equal(f.calls.at(-1).body.thread_ts, '1792000000.000001');
   assert.equal(f.decisionCalls.length, 1);
+});
+
+test('unregistered selection destinations are rejected before a message can be posted', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  f.decisionTarget = 'CLARIFY';
+  await worker.fetch(signedLine(f.env, [lineEvent('bad-selection')]), f.env);
+  await f.object.alarm();
+  const [selection] = f.db.prepare('SELECT token FROM routing_selections').all();
+  const bad = new URLSearchParams({ selection: selection.token, target: 'unregistered' });
+  await assert.rejects(() => worker.fetch(signedLine(f.env, [postbackEvent('invalid-selection', bad.toString())]), f.env), /Invalid routing selection/);
+  assert.equal(f.calls.length, 1);
+});
+
+test('selection cancellation never sends the held message', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  f.decisionTarget = 'CLARIFY';
+  await worker.fetch(signedLine(f.env, [lineEvent('cancelled-message')]), f.env);
+  await f.object.alarm();
+  await f.object.alarm();
+  const [selection] = f.db.prepare('SELECT token FROM routing_selections').all();
+  await worker.fetch(signedLine(f.env, [postbackEvent('cancel-selection', new URLSearchParams({ selection: selection.token, target: 'CANCEL' }).toString())]), f.env);
+  await f.object.alarm();
+  assert.equal(f.db.prepare("SELECT status FROM jobs WHERE id = 'line:cancelled-message'").get().status, 'cancelled');
+  assert.equal(f.calls.filter(call => call.url.endsWith('chat.postMessage')).length, 1);
+});
+
+test('legacy history is imported page by page before classification without replaying old replies', async t => {
+  const f = fixture(t);
+  f.db.exec("INSERT INTO threads VALUES ('1700.000001')");
+  const restarted = new BridgeObject(f.ctx, f.env);
+  f.env.BRIDGE.getByName = () => restarted;
+  f.decisionTarget = '1700.000001';
+  const requests = [];
+  const baseFetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (!url.endsWith('conversations.replies')) return baseFetch(url, options);
+    const params = new URLSearchParams(options.body); requests.push(Object.fromEntries(params));
+    if (!params.has('cursor')) return Response.json({ ok: true, has_more: true, response_metadata: { next_cursor: 'next-page' }, messages: [{ user: 'Uowner', ts: '1700.000001', text: '映画の予定' }] });
+    return Response.json({ ok: true, has_more: false, messages: [{ user: 'Udot', ts: '1700.000002', thread_ts: '1700.000001', text: '登録済みです' }] });
+  });
+  await worker.fetch(signedLine(f.env, [lineEvent('after-import', '映画の予定を変更して')]), f.env);
+  await restarted.alarm();
+  await restarted.alarm();
+  assert.equal(f.calls.length, 0);
+  await restarted.alarm();
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].cursor, 'next-page');
+  assert.equal(f.calls[0].body.thread_ts, '1700.000001');
+  const input = JSON.parse(f.decisionCalls[0].input[0].content[0].text);
+  assert.deepEqual(input.candidates[0].messages.map(message => message.text), ['映画の予定', '登録済みです']);
 });
 
 test('classification failure is persisted and never becomes an automatic new thread', async t => {
@@ -212,7 +262,7 @@ test('LINE is acknowledged before delivery and duplicate events deliver once', a
   assert.equal(f.calls[0].headers.Authorization, 'Bearer test-user-token');
 });
 
-test('unquoted LINE messages always start separate Slack threads', async t => {
+test('Decisions NEW results start separate Slack threads', async t => {
   const f = fixture(t);
   await establishSession(f);
   await worker.fetch(signedLine(f.env, [lineEvent('second', '別件です')]), f.env);
@@ -423,7 +473,17 @@ function imageFixture(t) {
   f.uploadGrant = { ok: true, file_id: 'Fimage', upload_url: 'https://files.slack.com/upload/v1/test-upload' };
   f.uploadResponse = () => new Response('OK');
   f.completeResult = { ok: true, files: [{ id: 'Fimage' }] };
+  f.fileMetadataCalls = 0;
+  f.contextImageCalls = 0;
   t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (url === 'https://slack.com/api/files.info') {
+      f.fileMetadataCalls++;
+      return Response.json({ ok: true, file: { id: 'Fimage', name: 'image.png', mimetype: 'image/png', url_private_download: 'https://files.slack.com/files-pri/T-Fimage/image.png' } });
+    }
+    if (url === 'https://files.slack.com/files-pri/T-Fimage/image.png') {
+      f.contextImageCalls++;
+      return new Response(f.bytes, { headers: { 'Content-Type': 'image/png' } });
+    }
     if (url === 'https://api-data.line.me/v2/bot/message/354718705033693859/content') {
       f.calls.push({ url, headers: options.headers });
       return f.imageResponse();
@@ -446,6 +506,40 @@ function imageFixture(t) {
   });
   return f;
 }
+
+test('a following message waits for the exact image thread then classifies using the real image evidence', async t => {
+  const f = imageFixture(t);
+  await worker.fetch(signedLine(f.env, [imageEvent('image-before-text')]), f.env);
+  await f.object.alarm();
+  f.decisionTarget = '1792000000.000001';
+  await worker.fetch(signedLine(f.env, [lineEvent('follow-image', 'これを予定に入れて')]), f.env);
+  await f.object.alarm();
+  assert.equal(f.calls.length, 4);
+  assert.equal(f.decisionCalls.length, 0);
+  await worker.fetch(signedSlack(f.env, imageShareEvent('image-ready')), f.env);
+  await f.object.alarm();
+  assert.equal(f.calls.at(-1).body.thread_ts, '1792000000.000001');
+  assert.equal(f.calls.at(-1).body.text, '<@Udot> これを予定に入れて');
+  assert.equal(f.fileMetadataCalls, 1);
+  assert.equal(f.contextImageCalls, 1);
+  assert.ok(f.decisionCalls[0].input[0].content.some(part => part.type === 'input_image'));
+});
+
+test('new image classification reuses the LINE download and can attach to an existing conversation', async t => {
+  const f = imageFixture(t);
+  await establishSession(f);
+  f.decisionTarget = '1792000000.000001';
+  await worker.fetch(signedLine(f.env, [imageEvent('related-image')]), f.env);
+  await f.object.alarm();
+  assert.equal(f.calls.filter(call => call.url.includes('api-data.line.me')).length, 1);
+  assert.equal(f.calls.at(-1).body.thread_ts, '1792000000.000001');
+  assert.equal(f.decisionCalls.length, 1);
+  assert.ok(f.decisionCalls[0].input[0].content.some(part => part.type === 'input_image'));
+  const event = imageShareEvent('related-image-ready');
+  event.event.ts = '1792000002.000001'; event.event.thread_ts = '1792000000.000001';
+  await worker.fetch(signedSlack(f.env, event), f.env);
+  assert.equal(f.db.prepare("SELECT status FROM jobs WHERE id = 'line:related-image'").get().status, 'done');
+});
 
 test('LINE image and only the Dots mention form one root post', async t => {
   const f = imageFixture(t);

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
+    "eval:routing": "node --env-file=../../work/line-dots.env scripts/evaluate-routing.js",
     "check": "node --check src/index.js",
     "deploy": "wrangler deploy"
   },

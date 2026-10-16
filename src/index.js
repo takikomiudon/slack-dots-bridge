@@ -1,5 +1,9 @@
+import { ConversationContext } from './context.js';
+import { classify, selectionMessage } from './routing.js';
+import { readImage, imageEvidence } from './images.js';
+
 const encoder = new TextEncoder();
-const secretNames = ['SLACK_USER_TOKEN', 'SLACK_SIGNING_SECRET', 'LINE_CHANNEL_SECRET', 'LINE_CHANNEL_ACCESS_TOKEN', 'LINE_ALLOWED_USER_ID', 'SLACK_TEAM_ID', 'SLACK_CHANNEL_ID', 'DOTS_USER_ID'];
+const secretNames = ['SLACK_USER_TOKEN', 'SLACK_SIGNING_SECRET', 'LINE_CHANNEL_SECRET', 'LINE_CHANNEL_ACCESS_TOKEN', 'LINE_ALLOWED_USER_ID', 'SLACK_TEAM_ID', 'SLACK_CHANNEL_ID', 'SLACK_USER_ID', 'DOTS_USER_ID', 'OPENAI_API_KEY'];
 
 function requireText(value, label) {
   if (typeof value !== 'string' || value.length === 0) throw new Error('Missing or invalid ' + label);
@@ -78,6 +82,8 @@ export class BridgeObject {
     this.sql.exec('CREATE TABLE IF NOT EXISTS pending_image_roots (file_id TEXT PRIMARY KEY NOT NULL)');
     // Keep replies to the existing conversation eligible after upgrading from the single-thread version.
     this.sql.exec('INSERT OR IGNORE INTO threads (thread) SELECT thread FROM session');
+    this.context = new ConversationContext(this.sql, env);
+    for (const row of this.context.missingImports()) this.enqueue('context:' + row.thread + ':0', 'context_import', { thread: row.thread, page: 0, cursor: '' });
   }
 
   enqueue(id, kind, payload, status = 'queued') {
@@ -89,13 +95,49 @@ export class BridgeObject {
     this.sql.exec("UPDATE jobs SET status = 'queued' WHERE status = 'waiting_thread' AND json_extract(payload, '$.thread') = ?", thread);
   }
 
+  nextJobs() {
+    return this.sql.exec("SELECT * FROM jobs WHERE status = 'queued' AND (kind NOT IN ('slack', 'slack_image') OR NOT EXISTS (SELECT 1 FROM routing_image_jobs i JOIN jobs j ON i.job = j.id WHERE j.status IN ('sending', 'waiting_image_root'))) ORDER BY CASE WHEN kind = 'context_import' THEN 0 ELSE 1 END, created, id LIMIT 1").toArray();
+  }
+
+  acceptSelection(event, id) {
+    const data = new URLSearchParams(requireText(event.postback.data, 'LINE postback data'));
+    const rows = this.sql.exec('SELECT * FROM routing_selections WHERE token = ?', requireText(data.get('selection'), 'routing selection token')).toArray();
+    if (rows.length !== 1) throw new Error('Invalid routing selection token');
+    const selection = rows[0];
+    const [job] = this.sql.exec('SELECT * FROM jobs WHERE id = ?', selection.job).toArray();
+    if (job.status !== 'awaiting_selection') return;
+    const choices = JSON.parse(selection.choices);
+    const payload = JSON.parse(job.payload);
+    let preview = '画像';
+    if (payload.text.length > 0) preview = payload.text;
+    if (data.has('page') && !data.has('target')) {
+      const page = requireText(data.get('page'), 'selection page');
+      if (!/^\d+$/.test(page)) throw new Error('Invalid routing selection page');
+      this.enqueue(id, 'line_control', { messages: [selectionMessage(selection.token, choices, preview, Number(page))] });
+      return;
+    }
+    const target = requireText(data.get('target'), 'routing selection target');
+    if (!['NEW', 'CANCEL', ...choices.map(choice => choice.thread)].includes(target)) throw new Error('Invalid routing selection target');
+    if (target === 'CANCEL') {
+      this.sql.exec("UPDATE jobs SET status = 'cancelled' WHERE id = ?", job.id);
+      return;
+    }
+    this.sql.exec("UPDATE routing_decisions SET target = ?, request_id = 'user-selection', confidence = 1 WHERE job = ?", target, job.id);
+    this.sql.exec("UPDATE jobs SET status = 'queued' WHERE id = ?", job.id);
+  }
+
   async fetch(request) {
     const payload = await request.json();
     this.ctx.storage.transactionSync(() => {
       if (new URL(request.url).pathname === '/line') {
         if (!Array.isArray(payload.events)) throw new Error('Invalid LINE events');
         for (const event of payload.events) {
-          if (event.type !== 'message' || event.source.type !== 'user' || event.source.userId !== this.env.LINE_ALLOWED_USER_ID) continue;
+          if (event.source.type !== 'user' || event.source.userId !== this.env.LINE_ALLOWED_USER_ID) continue;
+          if (event.type === 'postback') {
+            this.acceptSelection(event, 'line:' + requireText(event.webhookEventId, 'LINE webhookEventId'));
+            continue;
+          }
+          if (event.type !== 'message') continue;
           let kind;
           let message;
           if (event.message.type === 'text') {
@@ -109,12 +151,15 @@ export class BridgeObject {
             message = { imageId, text: '' };
           } else continue;
           if (Object.hasOwn(event.message, 'quotedMessageId')) message.quotedMessageId = requireText(event.message.quotedMessageId, 'LINE quotedMessageId');
-          this.enqueue('line:' + requireText(event.webhookEventId, 'LINE webhookEventId'), kind, message);
+          const id = 'line:' + requireText(event.webhookEventId, 'LINE webhookEventId');
+          this.enqueue(id, kind, message);
+          this.context.recordLine(id, 'user', '', message);
         }
       } else {
         if (payload.type !== 'event_callback' || payload.team_id !== this.env.SLACK_TEAM_ID) return;
         const event = payload.event;
         if (event.type !== 'message' || event.channel !== this.env.SLACK_CHANNEL_ID) return;
+        this.context.observe(event);
         // File completion returns no thread timestamp; match the signed share event by the exact file ID.
         if (Array.isArray(event.files)) {
           for (const file of event.files) {
@@ -123,7 +168,20 @@ export class BridgeObject {
             const thread = requireText(event.ts, 'Slack image root timestamp');
             if (Object.hasOwn(event, 'thread_ts') && event.thread_ts !== thread) throw new Error('Unexpected threaded image root');
             this.registerThread(thread);
+            this.context.markImported(thread);
             this.sql.exec('DELETE FROM pending_image_roots WHERE file_id = ?', file.id);
+          }
+          for (const file of event.files) {
+            const images = this.sql.exec('SELECT job FROM routing_image_jobs WHERE file_id = ?', file.id).toArray();
+            if (images.length === 0) continue;
+            let thread = requireText(event.ts, 'Slack image timestamp');
+            if (Object.hasOwn(event, 'thread_ts')) thread = requireText(event.thread_ts, 'Slack image thread');
+            const [decision] = this.sql.exec('SELECT target FROM routing_decisions WHERE job = ?', images[0].job).toArray();
+            if (decision.target !== 'NEW' && decision.target !== thread) throw new Error('Unexpected image routing thread');
+            this.context.setThread(images[0].job, thread);
+            this.sql.exec("UPDATE jobs SET status = 'done' WHERE id = ? AND status = 'waiting_image_root'", images[0].job);
+            this.sql.exec('DELETE FROM routing_image_jobs WHERE file_id = ?', file.id);
+            console.info(JSON.stringify({ event: 'image_thread_registered', job: images[0].job, thread }));
           }
         }
         if (event.user !== this.env.DOTS_USER_ID) return;
@@ -137,13 +195,13 @@ export class BridgeObject {
         }
       }
     });
-    const pending = this.sql.exec("SELECT id FROM jobs WHERE status = 'queued' LIMIT 1").toArray();
+    const pending = this.nextJobs();
     if (pending.length > 0) await this.ctx.storage.setAlarm(Date.now());
     return Response.json({ ok: true });
   }
 
   async alarm() {
-    const jobs = this.sql.exec("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created, id LIMIT 1").toArray();
+    const jobs = this.nextJobs();
     if (jobs.length === 0) return;
     const job = jobs[0];
     this.sql.exec("UPDATE jobs SET status = 'sending' WHERE id = ?", job.id);
@@ -153,10 +211,15 @@ export class BridgeObject {
       this.sql.exec("UPDATE jobs SET status = 'failed', error = ? WHERE id = ?", error, job.id);
       console.error(JSON.stringify({ event: 'delivery_failed', job: job.id, error }));
     } else {
-      this.sql.exec("UPDATE jobs SET status = 'done' WHERE id = ?", job.id);
-      console.info(JSON.stringify({ event: 'delivery_done', job: job.id }));
+      let status = 'done';
+      if (outcome.value === 'awaiting_selection') status = 'awaiting_selection';
+      if (outcome.value === 'waiting_image_root' && this.sql.exec('SELECT file_id FROM routing_image_jobs WHERE job = ?', job.id).toArray().length > 0) status = 'waiting_image_root';
+      this.sql.exec('UPDATE jobs SET status = ? WHERE id = ?', status, job.id);
+      let event = 'delivery_done';
+      if (status !== 'done') event = 'routing_waiting';
+      console.info(JSON.stringify({ event, job: job.id, status }));
     }
-    const pending = this.sql.exec("SELECT id FROM jobs WHERE status = 'queued' LIMIT 1").toArray();
+    const pending = this.nextJobs();
     if (pending.length > 0) await this.ctx.storage.setAlarm(Date.now());
     // shortcut: ambiguous external delivery is retained as failed/sending; reconcile before retrying to avoid duplicate Slack posts.
     if (outcome.status === 'rejected') throw new Error('Delivery failed for ' + job.id + ': ' + String(outcome.reason));
@@ -179,33 +242,52 @@ export class BridgeObject {
     return result;
   }
 
-  async deliverImage(payload, message) {
-    const response = await fetch('https://api-data.line.me/v2/bot/message/' + payload.imageId + '/content', {
-      headers: { Authorization: 'Bearer ' + this.env.LINE_CHANNEL_ACCESS_TOKEN }, signal: AbortSignal.timeout(30000),
-    });
-    if (response.status !== 200) throw new Error('LINE image HTTP ' + response.status);
-    const mime = requireText(response.headers.get('Content-Type'), 'LINE image Content-Type').split(';')[0].trim();
-    const extensions = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp' };
-    if (!Object.hasOwn(extensions, mime)) throw new Error('Unsupported LINE image content type: ' + mime);
-    if (!response.body) throw new Error('Missing LINE image body');
-    const reader = response.body.getReader();
-    const chunks = [];
-    let size = 0;
-    for (;;) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      size += chunk.value.byteLength;
-      if (size > 10 * 1024 * 1024) {
-        await reader.cancel();
-        throw new Error('LINE image exceeds 10 MiB');
-      }
-      chunks.push(chunk.value);
+  async importContext(job, payload) {
+    const parameters = new URLSearchParams({ channel: this.env.SLACK_CHANNEL_ID, ts: payload.thread, limit: '100' });
+    if (payload.cursor.length > 0) parameters.set('cursor', payload.cursor);
+    const result = await this.slackApi('conversations.replies', parameters);
+    if (!Array.isArray(result.messages) || typeof result.has_more !== 'boolean') throw new Error('Invalid Slack conversation import');
+    for (const message of result.messages) this.context.observe({ ...message, channel: this.env.SLACK_CHANNEL_ID });
+    if (result.has_more) {
+      const cursor = requireText(result.response_metadata.next_cursor, 'Slack import cursor');
+      this.enqueue('context:' + payload.thread + ':' + (payload.page + 1), 'context_import', { thread: payload.thread, page: payload.page + 1, cursor });
+    } else this.context.markImported(payload.thread);
+  }
+
+  async resolveRoute(job, payload) {
+    let target = '';
+    if (Object.hasOwn(payload, 'quotedMessageId')) {
+      const messages = this.sql.exec('SELECT thread FROM line_messages WHERE id = ?', payload.quotedMessageId).toArray();
+      if (messages.length !== 1) throw new Error('Unknown LINE quoted message: ' + payload.quotedMessageId);
+      target = messages[0].thread;
     }
-    if (size === 0) throw new Error('Empty LINE image');
-    const bytes = new Uint8Array(size);
-    let offset = 0;
-    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    const grant = await this.slackApi('files.getUploadURLExternal', new URLSearchParams({ filename: 'line-image-' + payload.imageId + '.' + extensions[mime], length: String(size) }));
+    const decisions = this.sql.exec('SELECT target FROM routing_decisions WHERE job = ?', job.id).toArray();
+    if (decisions.length === 1 && decisions[0].target !== 'CLARIFY') target = decisions[0].target;
+    const incomingImages = [];
+    if (job.kind === 'slack_image') incomingImages.push({ key: 'incoming-image', image: await readImage('https://api-data.line.me/v2/bot/message/' + payload.imageId + '/content', this.env.LINE_CHANNEL_ACCESS_TOKEN, 'LINE') });
+    if (target.length > 0) {
+      this.sql.exec("INSERT OR IGNORE INTO routing_decisions (job, target, request_id, confidence) VALUES (?, ?, 'explicit-quote', 1)", job.id, target);
+      return { target, incomingImages, choices: [] };
+    }
+    const missingFiles = this.sql.exec('SELECT DISTINCT f.value AS id FROM routing_events e JOIN threads t ON e.thread = t.thread, json_each(e.files) f WHERE f.value NOT IN (SELECT id FROM routing_files)').toArray();
+    for (const file of missingFiles) {
+      const result = await this.slackApi('files.info', new URLSearchParams({ file: file.id }));
+      if (result.file.id !== file.id) throw new Error('Unexpected Slack context file ID');
+      this.context.recordFile(result.file);
+    }
+    const incoming = { text: payload.text, images: incomingImages.map(image => image.key) };
+    const built = this.context.build(job.id, incoming);
+    let evidence = [];
+    if (built.context.candidates.length > 0) evidence = await imageEvidence(this.env, built.images, incomingImages);
+    const result = await classify(this.env, built.context, evidence);
+    this.sql.exec('INSERT INTO routing_decisions (job, target, request_id, confidence) VALUES (?, ?, ?, ?)', job.id, result.target, result.requestId, result.confidence);
+    console.info(JSON.stringify({ event: 'route_selected', job: job.id, target: result.target, requestId: result.requestId, confidence: result.confidence }));
+    return { target: result.target, incomingImages, choices: built.choices };
+  }
+
+  async deliverImage(job, payload, message, image) {
+    const { bytes, extension } = image;
+    const grant = await this.slackApi('files.getUploadURLExternal', new URLSearchParams({ filename: 'line-image-' + payload.imageId + '.' + extension, length: String(bytes.byteLength) }));
     const fileId = requireText(grant.file_id, 'Slack upload file id');
     const upload = new URL(requireText(grant.upload_url, 'Slack upload URL'));
     if (upload.origin !== 'https://files.slack.com' || !upload.pathname.startsWith('/upload/') || upload.username !== '' || upload.password !== '') throw new Error('Invalid Slack upload URL');
@@ -216,6 +298,7 @@ export class BridgeObject {
     if (uploaded.status !== 200) throw new Error('Slack image upload HTTP ' + uploaded.status);
     await uploaded.text();
     const share = { files: [{ id: fileId }], channel_id: this.env.SLACK_CHANNEL_ID, initial_comment: message.text };
+    this.sql.exec('INSERT INTO routing_image_jobs (file_id, job) VALUES (?, ?)', fileId, job.id);
     if (Object.hasOwn(message, 'thread_ts')) share.thread_ts = message.thread_ts;
     else this.sql.exec('INSERT INTO pending_image_roots (file_id) VALUES (?)', fileId);
     const shared = await this.slackApi('files.completeUploadExternal', share);
@@ -224,18 +307,27 @@ export class BridgeObject {
 
   async deliver(job) {
     const payload = JSON.parse(job.payload);
+    if (job.kind === 'context_import') {
+      await this.importContext(job, payload);
+      return;
+    }
     if (job.kind === 'slack' || job.kind === 'slack_image') {
+      const route = await this.resolveRoute(job, payload);
+      if (route.target === 'CLARIFY') {
+        const token = crypto.randomUUID();
+        this.sql.exec('INSERT INTO routing_selections (token, job, choices) VALUES (?, ?, ?)', token, job.id, JSON.stringify(route.choices));
+        let preview = '画像';
+        if (payload.text.length > 0) preview = payload.text;
+        this.enqueue('selection:' + job.id, 'line_control', { messages: [selectionMessage(token, route.choices, preview, 0)] });
+        return 'awaiting_selection';
+      }
       const text = payload.text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
       const body = { channel: this.env.SLACK_CHANNEL_ID, text: '<@' + this.env.DOTS_USER_ID + '>' };
       if (text.length > 0) body.text += ' ' + text;
-      if (Object.hasOwn(payload, 'quotedMessageId')) {
-        const messages = this.sql.exec('SELECT thread FROM line_messages WHERE id = ?', payload.quotedMessageId).toArray();
-        if (messages.length === 0) throw new Error('Unknown LINE quoted message: ' + payload.quotedMessageId);
-        body.thread_ts = messages[0].thread;
-      }
+      if (route.target !== 'NEW') body.thread_ts = route.target;
       if (job.kind === 'slack_image') {
-        await this.deliverImage(payload, body);
-        return;
+        await this.deliverImage(job, payload, body, route.incomingImages[0].image);
+        return 'waiting_image_root';
       }
       const response = await fetch('https://slack.com/api/chat.postMessage', {
         method: 'POST', headers: { Authorization: 'Bearer ' + this.env.SLACK_USER_TOKEN, 'Content-Type': 'application/json; charset=utf-8' },
@@ -245,12 +337,21 @@ export class BridgeObject {
       const result = await response.json();
       if (result.ok !== true) throw new Error('Slack API ' + requireText(result.error, 'Slack error'));
       requireText(result.ts, 'Slack message timestamp');
-      if (!Object.hasOwn(body, 'thread_ts')) this.registerThread(result.ts);
+      let thread = result.ts;
+      if (Object.hasOwn(body, 'thread_ts')) thread = body.thread_ts;
+      else {
+        this.registerThread(thread);
+        this.context.markImported(thread);
+      }
+      this.context.observe({ channel: this.env.SLACK_CHANNEL_ID, user: this.env.SLACK_USER_ID, ts: result.ts, thread_ts: thread, text: body.text });
+      this.context.setThread(job.id, thread);
       return;
     }
-    if (job.kind !== 'line') throw new Error('Unknown delivery kind');
-    const threads = this.sql.exec('SELECT thread FROM threads WHERE thread = ?', payload.thread).toArray();
-    if (threads.length === 0) return;
+    if (job.kind !== 'line' && job.kind !== 'line_control') throw new Error('Unknown delivery kind');
+    if (job.kind === 'line') {
+      const threads = this.sql.exec('SELECT thread FROM threads WHERE thread = ?', payload.thread).toArray();
+      if (threads.length === 0) return;
+    }
     const response = await fetch('https://api.line.me/v2/bot/message/push', {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + this.env.LINE_CHANNEL_ACCESS_TOKEN, 'Content-Type': 'application/json', 'X-Line-Retry-Key': job.retry_key },
@@ -261,8 +362,11 @@ export class BridgeObject {
     const result = await response.json();
     if (!Array.isArray(result.sentMessages) || result.sentMessages.length !== payload.messages.length) throw new Error('Invalid LINE sentMessages: expected one id per message');
     const ids = result.sentMessages.map(message => requireText(message.id, 'LINE sentMessages id'));
-    this.ctx.storage.transactionSync(() => {
-      for (const id of ids) this.sql.exec('INSERT OR IGNORE INTO line_messages (id, thread) VALUES (?, ?)', id, payload.thread);
+    if (job.kind === 'line') this.ctx.storage.transactionSync(() => {
+      for (let index = 0; index < ids.length; index++) {
+        this.sql.exec('INSERT OR IGNORE INTO line_messages (id, thread) VALUES (?, ?)', ids[index], payload.thread);
+        this.context.recordLine('sent:' + ids[index], 'assistant', payload.thread, { text: payload.messages[index].text });
+      }
     });
   }
 }
