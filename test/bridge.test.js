@@ -463,3 +463,11 @@ test('failed file sharing never mentions Dots and remains visible', async t => {
   assert.equal(f.calls.length, 5);
   assert.equal(f.calls.at(-1).url.endsWith('files.completeUploadExternal'), true);
 });
+
+test('successful binary upload may have an empty response body', async t => {
+  const f = imageFixture(t); f.uploadResponse = () => new Response();
+  await worker.fetch(signedLine(f.env, [imageEvent('empty-upload-response')]), f.env);
+  await f.object.alarm();
+  assert.equal(f.calls.at(-1).url, 'https://slack.com/api/chat.postMessage');
+  assert.match(f.calls.at(-1).body.text, /<@Udot>/);
+});

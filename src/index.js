@@ -188,7 +188,7 @@ export class BridgeObject {
       signal: AbortSignal.timeout(30000), redirect: 'error',
     });
     if (uploaded.status !== 200) throw new Error('Slack image upload HTTP ' + uploaded.status);
-    await uploaded.body.cancel();
+    await uploaded.text();
     if (!Object.hasOwn(message, 'thread_ts')) {
       const root = await this.slackApi('chat.postMessage', { channel: this.env.SLACK_CHANNEL_ID, text: '画像' });
       message.thread_ts = requireText(root.ts, 'Slack image thread timestamp');

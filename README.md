@@ -1,6 +1,6 @@
 # LINE → Slack → Dots 中継
 
-個人のLINE公式アカウント「Dots」（`@638fnwlr`）から、Slackの `#チャンネル-サンプル` にメンションを送り、Dotsのスレッド返信をLINEへ返します。登録したLINEユーザー1人からのテキストだけを受け付けます。
+個人のLINE公式アカウント「Dots」（`@638fnwlr`）から、Slackの `#チャンネル-サンプル` にメンションを送り、Dotsのスレッド返信をLINEへ返します。登録したLINEユーザー1人からのテキストと画像を受け付けます。
 
 ## 公開先
 
@@ -32,7 +32,7 @@ Dots側の対象はチャンネル `C0C94BHMQ7R`、投稿者 `U0CAE4018L8` の�
 - Slack → Worker → LINEの返送成功（`delivery_done`）
 - 先行テストの「LINE接続OK」は、LINE端末での受信もユーザーが確認済み
 - 署名のない本番リクエストは401。LINE公式Webhook接続テストとSlack URL検証は成功
-- ローカルの自動テスト20件と構文チェックは成功（通常送信・引用返信・複数スレッド・再起動・旧データ移行を含む）
+- ローカルの自動テスト30件と構文チェックは成功（通常送信・引用返信・複数スレッド・再起動・旧データ移行を含む）
 
 ## ローカルでの検証と公開
 
@@ -82,12 +82,20 @@ npx wrangler tail --format pretty
 
 外部APIのタイムアウトなど、送信済みか判断できない失敗は自動再送しません。キューの `failed` / `sending` 状態を残します。Slackの実際の投稿を確認したうえで再送の要否を判断してください。再起動後もスレッドとキューは保持されます。
 
+## LINEからの画像送信
+
+LINEに送ったJPEG・PNG・GIF・WebP画像を、元のバイト列のままSlackの非公開チャンネルへ添付します。上限は1枚10 MiBです。画像の再圧縮・変換は行わず、CloudflareのDBには画像IDと配信状態だけを保存します。画像本体は転送中だけメモリに保持し、読み込み上限を超えた時点で取得を中止します。
+
+通常の画像送信は新しいSlackスレッドを作ります。添付を共有し終えてから同じスレッドでDotsをメンションするため、添付前にDotsが起動する順序にはしません。Dotsの返信は既存の仕組みでLINEへ返します。複数枚を送った場合は1枚ずつ別のスレッドになります。
+
+追加でSlackアプリのUser OAuth権限 `files:write` が必要です。Slackへの再インストール後、トークンの権限をAPIで確認します。ファイルを公開URLに変換する処理はありません。LINE上の保存期限切れ、サイズ上限超過、権限不足などは `delivery_failed` と原因を記録します。
+
 ## 対応範囲
 
-- LINEの個人トークからのテキスト送信
+- LINEの個人トークからのテキスト・画像送信
 - Dotsによる、対応するSlackスレッド内の新規テキスト返信
 - LINEの文字数上限を超える回答の分割
 
-画像・ファイル・音声・グループトーク、Slack上の既存返信の編集反映は対象外です。メッセージと配信状態はDurable Objectに保存されます。
+10 MiBを超える画像、外部URLを使う画像プロバイダー、ファイル・音声・グループトーク、Slack上の既存返信の編集反映は対象外です。メッセージと配信状態はDurable Objectに保存されます。
 
 返信先の識別仕様は、LINE公式の[引用メッセージの受信](https://developers.line.biz/ja/docs/messaging-api/receiving-messages/#receive-quote-messages)と[送信時のメッセージID取得](https://developers.line.biz/ja/docs/messaging-api/get-quote-tokens/#get-quote-tokens-in-response)に基づいています。
