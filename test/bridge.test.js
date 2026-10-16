@@ -343,7 +343,8 @@ function imageFixture(t) {
       return f.imageResponse();
     }
     if (url === 'https://slack.com/api/files.getUploadURLExternal') {
-      f.calls.push({ url, body: JSON.parse(options.body), headers: options.headers });
+      assert.equal(options.headers['Content-Type'], 'application/x-www-form-urlencoded');
+      f.calls.push({ url, body: Object.fromEntries(new URLSearchParams(options.body)), headers: options.headers });
       return Response.json(f.uploadGrant);
     }
     if (url === 'https://files.slack.com/upload/v1/test-upload') {
@@ -375,7 +376,7 @@ test('LINE image is queued, uploaded privately unchanged, then Dots is mentioned
   ]);
   assert.equal(f.calls[0].headers.Authorization, 'Bearer test-line-token');
   assert.equal(f.calls[1].headers.Authorization, 'Bearer test-user-token');
-  assert.equal(f.calls[1].body.length, f.bytes.length);
+  assert.equal(f.calls[1].body.length, String(f.bytes.length));
   assert.match(f.calls[1].body.filename, /354718705033693859\.png$/);
   assert.deepEqual(f.calls[2].body, f.bytes);
   assert.equal(Object.hasOwn(f.calls[2].headers, 'Authorization'), false);
