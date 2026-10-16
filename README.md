@@ -15,7 +15,7 @@ Cloudflare WorkersとSQLite Durable Objectで動作します。PCを起動して
 
 LINEチャネル `2012039161` のWebhookを有効にし、定型の応答メッセージを無効にしています。
 
-Slackアプリ `line-dots-bridge`（`A0C9E19LY83`）は、User OAuthの `chat:write` と `groups:history` を使用します。Socket Modeを無効にし、`message.groups` の購読先を `/slack` に設定しています。権限自体は参加中のプライベートチャンネルに及びますが、中継コードは設定したチャンネル・DotsのユーザーID・スレッドだけを対象にします。
+Slackアプリ `line-dots-bridge`（`A0C9E19LY83`）は、User OAuthの `chat:write`、`groups:history`、`files:write` を使用します。Socket Modeを無効にし、`message.groups` の購読先を `/slack` に設定しています。権限自体は参加中のプライベートチャンネルに及びますが、中継コードは設定したチャンネル・DotsのユーザーID・スレッドだけを対象にします。
 
 User OAuth Tokenによる投稿には、本人のユーザーIDと中継アプリのBot IDが付きます。通常のメンションだけではDotsに起動イベントが届かなかったため、Dots側にもイベント駆動の受信設定を登録・有効化しています。定期ポーリングは使いません。
 
@@ -88,7 +88,9 @@ LINEに送ったJPEG・PNG・GIF・WebP画像を、元のバイト列のままSl
 
 通常の画像送信は新しいSlackスレッドを作ります。添付を共有し終えてから同じスレッドでDotsをメンションするため、添付前にDotsが起動する順序にはしません。Dotsの返信は既存の仕組みでLINEへ返します。複数枚を送った場合は1枚ずつ別のスレッドになります。
 
-追加でSlackアプリのUser OAuth権限 `files:write` が必要です。Slackへの再インストール後、トークンの権限をAPIで確認します。ファイルを公開URLに変換する処理はありません。LINE上の保存期限切れ、サイズ上限超過、権限不足などは `delivery_failed` と原因を記録します。
+2026年10月16日にSlack CLIで認証し、既存マニフェストにUser OAuth権限 `files:write` を追加しました。CLIと同じ再インストールAPIで反映し、本人のユーザーID・ワークスペースIDと、発行されたユーザートークンの権限を `auth.test` で確認済みです。更新したトークンをWorker Secretsへ登録し、画像対応版 `db7897a6-475e-4fe4-aa79-5dc2992608bf` を公開しました。実際のLINE画像に対するDotsの認識結果は確認待ちです。
+
+ファイルを公開URLに変換する処理はありません。LINE上の保存期限切れ、サイズ上限超過、権限不足などは `delivery_failed` と原因を記録します。
 
 ## 対応範囲
 
