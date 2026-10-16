@@ -348,6 +348,7 @@ function imageFixture(t) {
       return Response.json(f.uploadGrant);
     }
     if (url === 'https://files.slack.com/upload/v1/test-upload') {
+      assert.equal(options.redirect, 'manual');
       f.calls.push({ url, body: new Uint8Array(options.body), headers: options.headers });
       return f.uploadResponse();
     }
@@ -454,6 +455,14 @@ test('failed binary upload never creates a Slack root or wakes Dots', async t =>
   const f = imageFixture(t); f.uploadResponse = () => new Response('failed', { status: 500 });
   await worker.fetch(signedLine(f.env, [imageEvent('upload-failed')]), f.env);
   await assert.rejects(async () => f.object.alarm(), /Slack image upload HTTP 500/);
+  assert.equal(f.calls.length, 3);
+});
+
+test('binary upload redirects are rejected without following the target', async t => {
+  const f = imageFixture(t);
+  f.uploadResponse = () => new Response('', { status: 307, headers: { Location: 'https://untrusted.example/upload' } });
+  await worker.fetch(signedLine(f.env, [imageEvent('upload-redirect')]), f.env);
+  await assert.rejects(async () => f.object.alarm(), /Slack image upload HTTP 307/);
   assert.equal(f.calls.length, 3);
 });
 
