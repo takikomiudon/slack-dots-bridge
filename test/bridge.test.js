@@ -27,14 +27,24 @@ function fixture(t) {
     SLACK_USER_TOKEN: 'test-user-token', SLACK_SIGNING_SECRET: 'test-slack-secret',
     LINE_CHANNEL_SECRET: 'test-line-secret', LINE_CHANNEL_ACCESS_TOKEN: 'test-line-token',
     LINE_ALLOWED_USER_ID: 'Ulineowner', SLACK_TEAM_ID: 'Tteam',
-    SLACK_CHANNEL_ID: 'Cprivate', DOTS_USER_ID: 'Udot',
+    SLACK_CHANNEL_ID: 'Cprivate', SLACK_USER_ID: 'Uowner', DOTS_USER_ID: 'Udot', OPENAI_API_KEY: 'test-openai-key',
   };
   const object = new BridgeObject(ctx, env);
   env.BRIDGE = { getByName(name) { assert.equal(name, 'personal'); return object; } };
   const calls = [];
   let slackCount = 0;
   let lineCount = 0;
+  const f = { db, ctx, env, object, calls, decisionCalls: [], importCalls: [], decisionTarget: 'NEW' };
   t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (url === 'https://api.openai.com/v1/decisions') {
+      f.decisionCalls.push(JSON.parse(options.body));
+      return Response.json({ answers: [{ type: 'choice', name: 'thread', choice: f.decisionTarget, confidence: 0.97 }] }, { headers: { 'x-request-id': 'req_bridge' } });
+    }
+    if (url === 'https://slack.com/api/conversations.replies') {
+      const params = new URLSearchParams(options.body);
+      f.importCalls.push(Object.fromEntries(params));
+      return Response.json({ ok: true, has_more: false, messages: [{ user: 'Uowner', ts: params.get('ts'), text: '以前の会話' }] });
+    }
     calls.push({ url, body: JSON.parse(options.body), headers: options.headers });
     if (url === 'https://slack.com/api/chat.postMessage') {
       slackCount++;
@@ -44,7 +54,7 @@ function fixture(t) {
     const sentMessages = JSON.parse(options.body).messages.map(() => { lineCount++; return { id: 'line-sent-' + lineCount }; });
     return Response.json({ sentMessages });
   });
-  return { db, ctx, env, object, calls };
+  return f;
 }
 
 function lineEvent(id, text = 'こんにちは', userId = 'Ulineowner') {
@@ -69,6 +79,76 @@ async function establishSession(f) {
   assert.equal((await worker.fetch(signedLine(f.env, [lineEvent('initial')]), f.env)).status, 200);
   await f.object.alarm();
 }
+
+function postbackEvent(id, data, userId = 'Ulineowner') {
+  return { type: 'postback', webhookEventId: id, source: { type: 'user', userId }, postback: { data } };
+}
+
+test('unquoted continuation is routed by Decisions without exposing classification evidence to Dots', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  f.decisionTarget = '1792000000.000001';
+  await worker.fetch(signedLine(f.env, [lineEvent('continue', 'その予定を30分早めて')]), f.env);
+  await f.object.alarm();
+  assert.equal(f.decisionCalls.length, 1);
+  assert.equal(f.calls[1].body.thread_ts, '1792000000.000001');
+  assert.equal(f.calls[1].body.text, '<@Udot> その予定を30分早めて');
+  assert.equal(Object.hasOwn(f.calls[1].body, 'metadata'), false);
+  const input = JSON.parse(f.decisionCalls[0].input[0].content[0].text);
+  assert.equal(input.candidates[0].messages[0].text, 'こんにちは');
+  assert.equal(input.lineHistory[0].text, 'こんにちは');
+});
+
+test('explicit LINE quotes bypass Decisions even after automatic routing is enabled', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  await worker.fetch(signedSlack(f.env, slackEvent('quote-target')), f.env);
+  await f.object.alarm();
+  const event = lineEvent('explicit-quote', '続き'); event.message.quotedMessageId = 'line-sent-1';
+  await worker.fetch(signedLine(f.env, [event]), f.env);
+  await f.object.alarm();
+  assert.equal(f.decisionCalls.length, 0);
+  assert.equal(f.calls.at(-1).body.thread_ts, '1792000000.000001');
+});
+
+test('ambiguous routing waits for a signed owner selection then sends the original exactly once', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  f.decisionTarget = 'CLARIFY';
+  await worker.fetch(signedLine(f.env, [lineEvent('ambiguous', 'それお願い')]), f.env);
+  await f.object.alarm();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.db.prepare("SELECT status FROM jobs WHERE id = 'line:ambiguous'").get().status, 'awaiting_selection');
+  await f.object.alarm();
+  const menu = f.calls.at(-1).body.messages[0];
+  assert.equal(menu.type, 'flex');
+  const action = menu.contents.body.contents.find(x => x.type === 'button' && new URLSearchParams(x.action.data).get('target') === '1792000000.000001').action;
+  await worker.fetch(signedLine(f.env, [postbackEvent('foreign-selection', action.data, 'Uforeign')]), f.env);
+  assert.equal(f.db.prepare("SELECT status FROM jobs WHERE id = 'line:ambiguous'").get().status, 'awaiting_selection');
+  const bad = new URLSearchParams(action.data); bad.set('target', 'unregistered');
+  await assert.rejects(() => worker.fetch(signedLine(f.env, [postbackEvent('invalid-selection', bad.toString())]), f.env), /Invalid routing selection/);
+  for (let i = 0; i < 2; i++) await worker.fetch(signedLine(f.env, [postbackEvent('owner-selection', action.data)]), f.env);
+  await f.object.alarm();
+  await f.object.alarm();
+  assert.equal(f.calls.length, 3);
+  assert.equal(f.calls.at(-1).body.text, '<@Udot> それお願い');
+  assert.equal(f.calls.at(-1).body.thread_ts, '1792000000.000001');
+  assert.equal(f.decisionCalls.length, 1);
+});
+
+test('classification failure is persisted and never becomes an automatic new thread', async t => {
+  const f = fixture(t);
+  await establishSession(f);
+  const baseFetch = globalThis.fetch;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (url === 'https://api.openai.com/v1/decisions') return Response.json({ error: { code: 'insufficient_quota' } }, { status: 429, headers: { 'x-request-id': 'req_quota' } });
+    return baseFetch(url, options);
+  });
+  await worker.fetch(signedLine(f.env, [lineEvent('routing-failure')]), f.env);
+  await assert.rejects(() => f.object.alarm(), /Decisions HTTP 429.*req_quota/);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.db.prepare("SELECT status FROM jobs WHERE id = 'line:routing-failure'").get().status, 'failed');
+});
 
 test('health check validates configuration without exposing secrets', async t => {
   const f = fixture(t);
@@ -191,6 +271,7 @@ test('legacy thread stays eligible for Dots replies but normal sends start new t
   f.db.exec("INSERT INTO session (id, thread) VALUES (1, 'legacy-thread')");
   const restarted = new BridgeObject(f.ctx, f.env);
   f.env.BRIDGE.getByName = () => restarted;
+  await restarted.alarm();
   await worker.fetch(signedSlack(f.env, slackEvent('legacy-reply', '以前の会話の新しい回答', 'legacy-thread')), f.env);
   await restarted.alarm();
   assert.equal(f.calls[0].body.messages[0].text, '以前の会話の新しい回答');
