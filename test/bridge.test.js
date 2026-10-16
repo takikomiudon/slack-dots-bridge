@@ -329,6 +329,11 @@ function imageEvent(id) {
   return event;
 }
 
+function imageShareEvent(id, file = 'Fimage') {
+  return { type: 'event_callback', team_id: 'Tteam', event_id: id,
+    event: { type: 'message', channel: 'Cprivate', user: 'Uowner', ts: '1792000000.000001', files: [{ id: file }] } };
+}
+
 function imageFixture(t) {
   const f = fixture(t);
   const baseFetch = globalThis.fetch;
@@ -361,7 +366,7 @@ function imageFixture(t) {
   return f;
 }
 
-test('LINE image is queued, uploaded privately unchanged, then Dots is mentioned', async t => {
+test('LINE image and only the Dots mention form one root post', async t => {
   const f = imageFixture(t);
   for (let i = 0; i < 2; i++) assert.equal((await worker.fetch(signedLine(f.env, [imageEvent('photo')]), f.env)).status, 200);
   assert.equal(f.calls.length, 0);
@@ -371,9 +376,7 @@ test('LINE image is queued, uploaded privately unchanged, then Dots is mentioned
     'https://api-data.line.me/v2/bot/message/354718705033693859/content',
     'https://slack.com/api/files.getUploadURLExternal',
     'https://files.slack.com/upload/v1/test-upload',
-    'https://slack.com/api/chat.postMessage',
     'https://slack.com/api/files.completeUploadExternal',
-    'https://slack.com/api/chat.postMessage',
   ]);
   assert.equal(f.calls[0].headers.Authorization, 'Bearer test-line-token');
   assert.equal(f.calls[1].headers.Authorization, 'Bearer test-user-token');
@@ -381,12 +384,9 @@ test('LINE image is queued, uploaded privately unchanged, then Dots is mentioned
   assert.match(f.calls[1].body.filename, /354718705033693859\.png$/);
   assert.deepEqual(f.calls[2].body, f.bytes);
   assert.equal(Object.hasOwn(f.calls[2].headers, 'Authorization'), false);
-  assert.equal(f.calls[3].body.text.includes('<@Udot>'), false);
-  assert.equal(Object.hasOwn(f.calls[3].body, 'thread_ts'), false);
-  assert.deepEqual(f.calls[4].body, { files: [{ id: 'Fimage' }], channel_id: 'Cprivate', thread_ts: '1792000000.000001' });
-  assert.equal(f.calls[5].body.thread_ts, '1792000000.000001');
-  assert.match(f.calls[5].body.text, /<@Udot>/);
+  assert.deepEqual(f.calls[3].body, { files: [{ id: 'Fimage' }], channel_id: 'Cprivate', initial_comment: '<@Udot>' });
   assert.equal(f.db.prepare('SELECT payload FROM jobs').get().payload.includes('iVBOR'), false);
+  await worker.fetch(signedSlack(f.env, imageShareEvent('image-root')), f.env);
   await worker.fetch(signedSlack(f.env, slackEvent('photo-reply', '画像に赤い丸が見えます')), f.env);
   await f.object.alarm();
   assert.equal(f.calls.at(-1).body.messages[0].text, '画像に赤い丸が見えます');
@@ -402,9 +402,34 @@ test('image quote uses the exact existing thread without creating another root',
   await worker.fetch(signedLine(f.env, [event]), f.env);
   await f.object.alarm();
   const chats = f.calls.filter(c => c.url === 'https://slack.com/api/chat.postMessage');
-  assert.equal(chats.length, 1);
-  assert.equal(chats[0].body.thread_ts, '1792000000.000001');
-  assert.equal(f.calls.find(c => c.url.endsWith('files.completeUploadExternal')).body.thread_ts, '1792000000.000001');
+  assert.equal(chats.length, 0);
+  assert.deepEqual(f.calls.find(c => c.url.endsWith('files.completeUploadExternal')).body, {
+    files: [{ id: 'Fimage' }], channel_id: 'Cprivate', initial_comment: '<@Udot>', thread_ts: '1792000000.000001',
+  });
+});
+
+test('image thread registration survives restart and out-of-order reply events', async t => {
+  const f = imageFixture(t);
+  await worker.fetch(signedLine(f.env, [imageEvent('out-of-order-image')]), f.env);
+  await f.object.alarm();
+  const restarted = new BridgeObject(f.ctx, f.env);
+  f.env.BRIDGE.getByName = () => restarted;
+  await worker.fetch(signedSlack(f.env, slackEvent('early-image-reply', '画像の回答')), f.env);
+  await restarted.alarm();
+  assert.equal(f.calls.length, 4);
+  assert.equal(f.db.prepare("SELECT status FROM jobs WHERE id = 'slack:early-image-reply:0'").get().status, 'waiting_thread');
+  const wrongChannel = imageShareEvent('other-channel'); wrongChannel.event.channel = 'Cother';
+  const wrongTeam = imageShareEvent('other-team'); wrongTeam.team_id = 'Tother';
+  for (const event of [wrongChannel, wrongTeam, imageShareEvent('other-file', 'Funrelated')]) await worker.fetch(signedSlack(f.env, event), f.env);
+  await restarted.alarm();
+  assert.equal(f.calls.length, 4);
+  const shared = imageShareEvent('known-root'); shared.event.subtype = 'file_share';
+  await worker.fetch(signedSlack(f.env, shared), f.env);
+  await restarted.alarm();
+  assert.equal(f.calls.at(-1).body.messages[0].text, '画像の回答');
+  await worker.fetch(signedSlack(f.env, shared), f.env);
+  await restarted.alarm();
+  assert.equal(f.calls.length, 5);
 });
 
 test('LINE missing image content is persisted as a failure without Slack posts', async t => {
@@ -470,7 +495,7 @@ test('failed file sharing never mentions Dots and remains visible', async t => {
   const f = imageFixture(t); f.completeResult = { ok: false, error: 'file_not_found' };
   await worker.fetch(signedLine(f.env, [imageEvent('share-failed')]), f.env);
   await assert.rejects(async () => f.object.alarm(), /files.completeUploadExternal.*file_not_found/);
-  assert.equal(f.calls.length, 5);
+  assert.equal(f.calls.length, 4);
   assert.equal(f.calls.at(-1).url.endsWith('files.completeUploadExternal'), true);
 });
 
@@ -478,6 +503,6 @@ test('successful binary upload may have an empty response body', async t => {
   const f = imageFixture(t); f.uploadResponse = () => new Response();
   await worker.fetch(signedLine(f.env, [imageEvent('empty-upload-response')]), f.env);
   await f.object.alarm();
-  assert.equal(f.calls.at(-1).url, 'https://slack.com/api/chat.postMessage');
-  assert.match(f.calls.at(-1).body.text, /<@Udot>/);
+  assert.equal(f.calls.at(-1).url, 'https://slack.com/api/files.completeUploadExternal');
+  assert.equal(f.calls.at(-1).body.initial_comment, '<@Udot>');
 });
