@@ -110,11 +110,12 @@ test('LINE verification with an empty event list succeeds', async t => {
   assert.equal(f.calls.length, 0);
 });
 
-test('only the configured LINE owner can send text to Slack', async t => {
+test('strangers, groups and unsupported LINE message types are ignored', async t => {
   const f = fixture(t);
-  const image = lineEvent('image'); image.message = { type: 'image', id: 'image-id' };
+  const video = lineEvent('video'); video.message = { type: 'video', id: 'video-id' };
+  const image = lineEvent('stranger-image', '', 'Ustranger'); image.message = { type: 'image', id: '123', contentProvider: { type: 'line' } };
   const group = lineEvent('group'); group.source.type = 'group';
-  await worker.fetch(signedLine(f.env, [lineEvent('stranger', '秘密', 'Ustranger'), image, group]), f.env);
+  await worker.fetch(signedLine(f.env, [lineEvent('stranger', '秘密', 'Ustranger'), image, video, group]), f.env);
   await f.object.alarm();
   assert.equal(f.calls.length, 0);
 });
@@ -319,4 +320,146 @@ test('LINE 409 without accepted-request-id is an error', async t => {
   t.mock.method(globalThis, 'fetch', async () => Response.json({ message: 'conflict' }, { status: 409 }));
   await worker.fetch(signedSlack(f.env, slackEvent('unaccepted')), f.env);
   await assert.rejects(async () => f.object.alarm(), /LINE HTTP 409/);
+});
+
+
+function imageEvent(id) {
+  const event = lineEvent(id);
+  event.message = { type: 'image', id: '354718705033693859', contentProvider: { type: 'line' } };
+  return event;
+}
+
+function imageFixture(t) {
+  const f = fixture(t);
+  const baseFetch = globalThis.fetch;
+  f.bytes = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  f.imageResponse = () => new Response(f.bytes, { headers: { 'Content-Type': 'image/png' } });
+  f.uploadGrant = { ok: true, file_id: 'Fimage', upload_url: 'https://files.slack.com/upload/v1/test-upload' };
+  f.uploadResponse = () => new Response('OK');
+  f.completeResult = { ok: true, files: [{ id: 'Fimage' }] };
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    if (url === 'https://api-data.line.me/v2/bot/message/354718705033693859/content') {
+      f.calls.push({ url, headers: options.headers });
+      return f.imageResponse();
+    }
+    if (url === 'https://slack.com/api/files.getUploadURLExternal') {
+      f.calls.push({ url, body: JSON.parse(options.body), headers: options.headers });
+      return Response.json(f.uploadGrant);
+    }
+    if (url === 'https://files.slack.com/upload/v1/test-upload') {
+      f.calls.push({ url, body: new Uint8Array(options.body), headers: options.headers });
+      return f.uploadResponse();
+    }
+    if (url === 'https://slack.com/api/files.completeUploadExternal') {
+      f.calls.push({ url, body: JSON.parse(options.body), headers: options.headers });
+      return Response.json(f.completeResult);
+    }
+    return baseFetch(url, options);
+  });
+  return f;
+}
+
+test('LINE image is queued, uploaded privately unchanged, then Dots is mentioned', async t => {
+  const f = imageFixture(t);
+  for (let i = 0; i < 2; i++) assert.equal((await worker.fetch(signedLine(f.env, [imageEvent('photo')]), f.env)).status, 200);
+  assert.equal(f.calls.length, 0);
+  await f.object.alarm();
+  await f.object.alarm();
+  assert.deepEqual(f.calls.map(c => c.url), [
+    'https://api-data.line.me/v2/bot/message/354718705033693859/content',
+    'https://slack.com/api/files.getUploadURLExternal',
+    'https://files.slack.com/upload/v1/test-upload',
+    'https://slack.com/api/chat.postMessage',
+    'https://slack.com/api/files.completeUploadExternal',
+    'https://slack.com/api/chat.postMessage',
+  ]);
+  assert.equal(f.calls[0].headers.Authorization, 'Bearer test-line-token');
+  assert.equal(f.calls[1].headers.Authorization, 'Bearer test-user-token');
+  assert.equal(f.calls[1].body.length, f.bytes.length);
+  assert.match(f.calls[1].body.filename, /354718705033693859\.png$/);
+  assert.deepEqual(f.calls[2].body, f.bytes);
+  assert.equal(Object.hasOwn(f.calls[2].headers, 'Authorization'), false);
+  assert.equal(f.calls[3].body.text.includes('<@Udot>'), false);
+  assert.equal(Object.hasOwn(f.calls[3].body, 'thread_ts'), false);
+  assert.deepEqual(f.calls[4].body, { files: [{ id: 'Fimage' }], channel_id: 'Cprivate', thread_ts: '1792000000.000001' });
+  assert.equal(f.calls[5].body.thread_ts, '1792000000.000001');
+  assert.match(f.calls[5].body.text, /<@Udot>/);
+  assert.equal(f.db.prepare('SELECT payload FROM jobs').get().payload.includes('iVBOR'), false);
+  await worker.fetch(signedSlack(f.env, slackEvent('photo-reply', '画像に赤い丸が見えます')), f.env);
+  await f.object.alarm();
+  assert.equal(f.calls.at(-1).body.messages[0].text, '画像に赤い丸が見えます');
+});
+
+test('image quote uses the exact existing thread without creating another root', async t => {
+  const f = imageFixture(t);
+  await establishSession(f);
+  await worker.fetch(signedSlack(f.env, slackEvent('text-reply')), f.env);
+  await f.object.alarm();
+  f.calls.length = 0;
+  const event = imageEvent('quoted-photo'); event.message.quotedMessageId = 'line-sent-1';
+  await worker.fetch(signedLine(f.env, [event]), f.env);
+  await f.object.alarm();
+  const chats = f.calls.filter(c => c.url === 'https://slack.com/api/chat.postMessage');
+  assert.equal(chats.length, 1);
+  assert.equal(chats[0].body.thread_ts, '1792000000.000001');
+  assert.equal(f.calls.find(c => c.url.endsWith('files.completeUploadExternal')).body.thread_ts, '1792000000.000001');
+});
+
+test('LINE missing image content is persisted as a failure without Slack posts', async t => {
+  const f = imageFixture(t);
+  f.imageResponse = () => new Response('Gone', { status: 410 });
+  await worker.fetch(signedLine(f.env, [imageEvent('gone-photo')]), f.env);
+  await assert.rejects(async () => f.object.alarm(), /LINE image HTTP 410/);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.db.prepare('SELECT status FROM jobs').get().status, 'failed');
+});
+
+test('image transfer rejects unsupported MIME types before uploading', async t => {
+  const f = imageFixture(t);
+  f.imageResponse = () => new Response('not an image', { headers: { 'Content-Type': 'text/html' } });
+  await worker.fetch(signedLine(f.env, [imageEvent('html-photo')]), f.env);
+  await assert.rejects(async () => f.object.alarm(), /Unsupported LINE image content type/);
+  assert.equal(f.calls.length, 1);
+});
+
+test('image transfer stops reading at 10 MiB and never uploads oversized bytes', async t => {
+  const f = imageFixture(t);
+  let cancelled = false;
+  f.imageResponse = () => new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(10 * 1024 * 1024)); controller.enqueue(new Uint8Array(1)); },
+    cancel() { cancelled = true; },
+  }), { headers: { 'Content-Type': 'image/png' } });
+  await worker.fetch(signedLine(f.env, [imageEvent('large-photo')]), f.env);
+  await assert.rejects(async () => f.object.alarm(), /LINE image exceeds 10 MiB/);
+  assert.equal(cancelled, true);
+  assert.equal(f.calls.length, 1);
+});
+
+test('Slack missing file permission is explicit and does not post or mention Dots', async t => {
+  const f = imageFixture(t); f.uploadGrant = { ok: false, error: 'missing_scope' };
+  await worker.fetch(signedLine(f.env, [imageEvent('no-files-scope')]), f.env);
+  await assert.rejects(async () => f.object.alarm(), /files.getUploadURLExternal.*missing_scope/);
+  assert.equal(f.calls.length, 2);
+});
+
+test('upload grant cannot send image data or credentials to an unexpected host', async t => {
+  const f = imageFixture(t); f.uploadGrant.upload_url = 'https://untrusted.example/upload';
+  await worker.fetch(signedLine(f.env, [imageEvent('bad-upload-host')]), f.env);
+  await assert.rejects(async () => f.object.alarm(), /Invalid Slack upload URL/);
+  assert.equal(f.calls.length, 2);
+});
+
+test('failed binary upload never creates a Slack root or wakes Dots', async t => {
+  const f = imageFixture(t); f.uploadResponse = () => new Response('failed', { status: 500 });
+  await worker.fetch(signedLine(f.env, [imageEvent('upload-failed')]), f.env);
+  await assert.rejects(async () => f.object.alarm(), /Slack image upload HTTP 500/);
+  assert.equal(f.calls.length, 3);
+});
+
+test('failed file sharing never mentions Dots and remains visible', async t => {
+  const f = imageFixture(t); f.completeResult = { ok: false, error: 'file_not_found' };
+  await worker.fetch(signedLine(f.env, [imageEvent('share-failed')]), f.env);
+  await assert.rejects(async () => f.object.alarm(), /files.completeUploadExternal.*file_not_found/);
+  assert.equal(f.calls.length, 5);
+  assert.equal(f.calls.at(-1).url.endsWith('files.completeUploadExternal'), true);
 });
