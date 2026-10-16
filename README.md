@@ -32,7 +32,8 @@ Dots側の対象はチャンネル `C0C94BHMQ7R`、投稿者 `U0CAE4018L8` の�
 - Slack → Worker → LINEの返送成功（`delivery_done`）
 - 先行テストの「LINE接続OK」は、LINE端末での受信もユーザーが確認済み
 - 署名のない本番リクエストは401。LINE公式Webhook接続テストとSlack URL検証は成功
-- ローカルの自動テスト30件と構文チェックは成功（通常送信・引用返信・複数スレッド・再起動・旧データ移行を含む）
+- ローカルの自動テスト32件と構文チェックは成功（通常送信・引用返信・複数スレッド・再起動・旧データ移行・リダイレクト拒否を含む）
+- workerdと実際のSQLite Durable Object・Alarmを起動する統合テストで、画像取得→Slack添付→メンション→LINE返送を検証（外部APIはテスト用の応答）
 
 ## ローカルでの検証と公開
 
@@ -90,7 +91,9 @@ LINEに送ったJPEG・PNG・GIF・WebP画像を、元のバイト列のままSl
 
 2026年10月16日にSlack CLIで認証し、既存マニフェストにUser OAuth権限 `files:write` を追加しました。CLIと同じ再インストールAPIで反映し、本人のユーザーID・ワークスペースIDと、発行されたユーザートークンの権限を `auth.test` で確認済みです。更新したトークンをWorker Secretsへ登録しています。
 
-初回の実画像送信は、Slackの `files.getUploadURLExternal` がJSON本文の `filename`・`length` を未指定として扱い、`invalid_arguments` で失敗しました。フォーム形式で成功することを実APIで確認し、形式を検証する回帰テストを追加して修正しました。添付確定APIはJSON形式で受理されることを確認済みです。修正版 `00345cfa-9c87-4dd1-bb06-3d029763e8a8` を公開し、実際のLINE画像に対するDotsの認識結果は再確認待ちです。
+初回の実画像送信は、Slackの `files.getUploadURLExternal` がJSON本文の `filename`・`length` を未指定として扱い、`invalid_arguments` で失敗しました。フォーム形式で成功することを実APIで確認し、形式を検証する回帰テストを追加して修正しました。添付確定APIはJSON形式で受理されることを確認済みです。
+
+再送時にはworkerdが `redirect: 'error'` をサポートしないことが判明しました。`manual` に変更してHTTP 200以外は拒否し、転送先へのリダイレクトに追従しない方針を保っています。回帰テストとworkerdの統合テストを追加し、修正版 `51af3285-0de6-4761-89ca-e29d2db91916` を公開しました。実際のLINE画像に対するDotsの認識結果は再確認待ちです。
 
 ファイルを公開URLに変換する処理はありません。LINE上の保存期限切れ、サイズ上限超過、権限不足などは `delivery_failed` と原因を記録します。
 
