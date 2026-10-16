@@ -55,7 +55,9 @@ test('image context keeps private file references without storing image bytes', 
   const { sql, context } = fixture(t);
   sql.exec("INSERT INTO threads VALUES ('100.001')");
   context.markImported('100.001');
-  context.observe({ channel: 'private', user: 'owner', ts: '100.001', text: '<@dot>', files: [{ id: 'Fimage', mimetype: 'image/jpeg', url_private_download: 'https://files.slack.com/files-pri/T-F/download/photo.jpg' }] });
+  const file = { id: 'Fimage', name: 'photo.jpg', mimetype: 'image/jpeg', url_private_download: 'https://files.slack.com/files-pri/T-F/download/photo.jpg' };
+  context.observe({ channel: 'private', user: 'owner', ts: '100.001', text: '<@dot>', files: [{ id: 'Fimage' }] });
+  context.recordFile(file);
   context.recordLine('incoming', 'user', '', { text: 'この予定を変更して' });
   const built = context.build('incoming', { text: 'この予定を変更して' });
   assert.deepEqual(built.context.candidates[0].messages[0].images, ['Fimage']);
