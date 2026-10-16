@@ -89,10 +89,21 @@ export class BridgeObject {
       if (new URL(request.url).pathname === '/line') {
         if (!Array.isArray(payload.events)) throw new Error('Invalid LINE events');
         for (const event of payload.events) {
-          if (event.type !== 'message' || event.source.type !== 'user' || event.source.userId !== this.env.LINE_ALLOWED_USER_ID || event.message.type !== 'text') continue;
-          const message = { text: requireText(event.message.text, 'LINE text') };
+          if (event.type !== 'message' || event.source.type !== 'user' || event.source.userId !== this.env.LINE_ALLOWED_USER_ID) continue;
+          let kind;
+          let message;
+          if (event.message.type === 'text') {
+            kind = 'slack';
+            message = { text: requireText(event.message.text, 'LINE text') };
+          } else if (event.message.type === 'image') {
+            if (event.message.contentProvider.type !== 'line') throw new Error('Unsupported LINE image content provider');
+            const imageId = requireText(event.message.id, 'LINE image id');
+            if (!/^\d+$/.test(imageId)) throw new Error('Invalid LINE image id');
+            kind = 'slack_image';
+            message = { imageId, text: 'この画像の内容を確認してください。' };
+          } else continue;
           if (Object.hasOwn(event.message, 'quotedMessageId')) message.quotedMessageId = requireText(event.message.quotedMessageId, 'LINE quotedMessageId');
-          this.enqueue('line:' + requireText(event.webhookEventId, 'LINE webhookEventId'), 'slack', message);
+          this.enqueue('line:' + requireText(event.webhookEventId, 'LINE webhookEventId'), kind, message);
         }
       } else {
         if (payload.type !== 'event_callback' || payload.team_id !== this.env.SLACK_TEAM_ID) return;
@@ -131,15 +142,80 @@ export class BridgeObject {
     if (outcome.status === 'rejected') throw new Error('Delivery failed for ' + job.id + ': ' + String(outcome.reason));
   }
 
+  async slackApi(method, body) {
+    const response = await fetch('https://slack.com/api/' + method, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + this.env.SLACK_USER_TOKEN, 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify(body), signal: AbortSignal.timeout(30000),
+    });
+    if (!response.ok) throw new Error('Slack ' + method + ' HTTP ' + response.status);
+    const result = await response.json();
+    if (result.ok !== true) throw new Error('Slack ' + method + ' API ' + requireText(result.error, 'Slack error'));
+    return result;
+  }
+
+  async deliverImage(payload, message) {
+    const response = await fetch('https://api-data.line.me/v2/bot/message/' + payload.imageId + '/content', {
+      headers: { Authorization: 'Bearer ' + this.env.LINE_CHANNEL_ACCESS_TOKEN }, signal: AbortSignal.timeout(30000),
+    });
+    if (response.status !== 200) throw new Error('LINE image HTTP ' + response.status);
+    const mime = requireText(response.headers.get('Content-Type'), 'LINE image Content-Type').split(';')[0].trim();
+    const extensions = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp' };
+    if (!Object.hasOwn(extensions, mime)) throw new Error('Unsupported LINE image content type: ' + mime);
+    if (!response.body) throw new Error('Missing LINE image body');
+    const reader = response.body.getReader();
+    const chunks = [];
+    let size = 0;
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > 10 * 1024 * 1024) {
+        await reader.cancel();
+        throw new Error('LINE image exceeds 10 MiB');
+      }
+      chunks.push(chunk.value);
+    }
+    if (size === 0) throw new Error('Empty LINE image');
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    const grant = await this.slackApi('files.getUploadURLExternal', { filename: 'line-image-' + payload.imageId + '.' + extensions[mime], length: size });
+    const fileId = requireText(grant.file_id, 'Slack upload file id');
+    const upload = new URL(requireText(grant.upload_url, 'Slack upload URL'));
+    if (upload.origin !== 'https://files.slack.com' || !upload.pathname.startsWith('/upload/') || upload.username !== '' || upload.password !== '') throw new Error('Invalid Slack upload URL');
+    const uploaded = await fetch(upload.href, {
+      method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: bytes,
+      signal: AbortSignal.timeout(30000), redirect: 'error',
+    });
+    if (uploaded.status !== 200) throw new Error('Slack image upload HTTP ' + uploaded.status);
+    await uploaded.body.cancel();
+    if (!Object.hasOwn(message, 'thread_ts')) {
+      const root = await this.slackApi('chat.postMessage', { channel: this.env.SLACK_CHANNEL_ID, text: '画像' });
+      message.thread_ts = requireText(root.ts, 'Slack image thread timestamp');
+      this.sql.exec('INSERT OR IGNORE INTO threads (thread) VALUES (?)', message.thread_ts);
+    }
+    const shared = await this.slackApi('files.completeUploadExternal', {
+      files: [{ id: fileId }], channel_id: this.env.SLACK_CHANNEL_ID, thread_ts: message.thread_ts,
+    });
+    if (!Array.isArray(shared.files) || shared.files.length !== 1 || shared.files[0].id !== fileId) throw new Error('Invalid Slack completed file');
+    // Mention only after the file is shared so Dots can read the attachment when it wakes.
+    const posted = await this.slackApi('chat.postMessage', message);
+    requireText(posted.ts, 'Slack image mention timestamp');
+  }
+
   async deliver(job) {
     const payload = JSON.parse(job.payload);
-    if (job.kind === 'slack') {
+    if (job.kind === 'slack' || job.kind === 'slack_image') {
       const text = payload.text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
       const body = { channel: this.env.SLACK_CHANNEL_ID, text: '<@' + this.env.DOTS_USER_ID + '> ' + text };
       if (Object.hasOwn(payload, 'quotedMessageId')) {
         const messages = this.sql.exec('SELECT thread FROM line_messages WHERE id = ?', payload.quotedMessageId).toArray();
         if (messages.length === 0) throw new Error('Unknown LINE quoted message: ' + payload.quotedMessageId);
         body.thread_ts = messages[0].thread;
+      }
+      if (job.kind === 'slack_image') {
+        await this.deliverImage(payload, body);
+        return;
       }
       const response = await fetch('https://slack.com/api/chat.postMessage', {
         method: 'POST', headers: { Authorization: 'Bearer ' + this.env.SLACK_USER_TOKEN, 'Content-Type': 'application/json; charset=utf-8' },
