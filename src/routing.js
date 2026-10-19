@@ -50,7 +50,10 @@ export function selectionMessage(token, choices, preview, page) {
   const pages = Math.ceil(choices.length / 5);
   if (!Number.isInteger(page) || page < 0 || page >= pages) throw new Error('Invalid selection page');
   function button(label, data) {
-    return { type: 'button', action_id: 'route', text: { type: 'plain_text', text: shorten(label, 75) }, value: new URLSearchParams({ selection: token, ...data }).toString() };
+    let action;
+    if (Object.hasOwn(data, 'target')) action = 'route:target:' + data.target;
+    else action = 'route:page:' + data.page;
+    return { type: 'button', action_id: action, text: { type: 'plain_text', text: shorten(label, 75) }, value: new URLSearchParams({ selection: token, ...data }).toString() };
   }
   const choicesButtons = choices.slice(page * 5, page * 5 + 5).map(choice => button(choice.label, { target: choice.thread }));
   const controls = [button('新しい会話', { target: 'NEW' }), button('送信しない', { target: 'CANCEL' })];

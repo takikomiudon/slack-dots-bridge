@@ -64,7 +64,7 @@ test('clarification uses native Slack buttons with exact job-specific values and
   for (const button of buttons) {
     assert.ok(button.text.text.length <= 75);
     assert.equal(button.text.text.isWellFormed(), true);
-    assert.equal(button.action_id, 'route');
+    assert.ok(button.action_id.startsWith('route:'));
     assert.equal(new URLSearchParams(button.value).get('selection'), 'selection-token');
   }
   const targets = buttons.map(button => new URLSearchParams(button.value).get('target'));

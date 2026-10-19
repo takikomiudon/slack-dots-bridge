@@ -89,9 +89,13 @@ export class BridgeObject {
   }
   acceptSelection(payload) {
     if (payload.type !== 'block_actions' || payload.team.id !== this.env.SLACK_TEAM_ID || payload.user.id !== this.env.SLACK_USER_ID || payload.channel.id !== this.env.SLACK_DM_CHANNEL_ID) return new Response('Invalid selection owner', { status: 403 });
-    if (!Array.isArray(payload.actions) || payload.actions.length !== 1 || payload.actions[0].action_id !== 'route') throw new Error('Invalid routing action');
+    if (!Array.isArray(payload.actions) || payload.actions.length !== 1) throw new Error('Invalid routing action');
     const action = payload.actions[0];
     const data = new URLSearchParams(requireText(action.value, 'routing action value'));
+    let expectedAction;
+    if (data.has('target')) expectedAction = 'route:target:' + requireText(data.get('target'), 'selection target');
+    else expectedAction = 'route:page:' + requireText(data.get('page'), 'selection page');
+    if (action.action_id !== expectedAction) throw new Error('Invalid routing action ID');
     const rows = this.sql.exec('SELECT * FROM routing_selections WHERE token = ?', requireText(data.get('selection'), 'selection token')).toArray();
     if (rows.length !== 1) throw new Error('Invalid routing selection token');
     const selection = rows[0];

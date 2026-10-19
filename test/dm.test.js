@@ -65,7 +65,8 @@ function signed(env, payload, path = '/slack', timestamp = String(Math.floor(Dat
 }
 
 function action(value, id = '1.001') {
-  return { type: 'block_actions', team: { id: 'Tteam' }, user: { id: 'Uowner' }, channel: { id: 'Dinbox' }, actions: [{ action_id: 'route', action_ts: id, value }] };
+  const data = new URLSearchParams(value);
+  return { type: 'block_actions', team: { id: 'Tteam' }, user: { id: 'Uowner' }, channel: { id: 'Dinbox' }, actions: [{ action_id: 'route:target:' + data.get('target'), action_ts: id, value }] };
 }
 
 test('a DM is classified once and forwarded to a new channel thread as the owner', async t => {
