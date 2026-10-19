@@ -63,7 +63,7 @@ npx wrangler secret bulk ../../work/line-dots.env
 
 LINEの送受信コードを撤去し、`/line` はHTTP 410を返します。LINE用の送信トークンは失効済みで、旧トークンでの認証が401になることを確認しました。LINE用の3項目はローカル環境ファイルとWorker Secretsから削除済みです。未完了のLINEジョブは廃止状態にし、会話と履歴は保持します。
 
-LINE Developersの「Webhookの利用」をオフにする操作だけは、管理画面の再ログインが必要なため未完了です。サーバー側のLINE処理は停止しています。LINE公式アカウント自体の削除は行っていません。既存のSlack購読URLを維持するため、Worker名と公開URLには旧名称が残っています。
+2026年10月20日にLINE Developersへ再ログインし、「Webhookの利用」もオフにしました。サーバー側・LINE側ともに中継を停止しています。LINE公式アカウント自体の削除は行っていません。既存のSlack購読URLを維持するため、Worker名と公開URLには旧名称が残っています。
 
 ## 検証・公開
 
