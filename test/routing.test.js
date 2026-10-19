@@ -59,6 +59,7 @@ test('clarification uses native Slack buttons with exact job-specific values and
   const menu = selectionMessage('selection-token', choices, 'どの予定のこと？', 1);
   const actionBlocks = menu.blocks.filter(block => block.type === 'actions');
   const buttons = actionBlocks.flatMap(block => block.elements);
+  assert.equal(new Set(buttons.map(button => button.action_id)).size, buttons.length);
   assert.ok(actionBlocks.every(block => block.elements.length <= 5));
   for (const button of buttons) {
     assert.ok(button.text.text.length <= 75);
