@@ -14,13 +14,27 @@ export function decisionRequest(context, images) {
   return { model: 'gpt-6-luna', input: [{ role: 'user', content }], questions: [{ type: 'choice', name: 'thread', instructions, choices }] };
 }
 
+async function decisionResponse(env, body) {
+  const payload = JSON.stringify(body);
+  for (let attempt = 0; ; attempt++) {
+    const response = await fetch('https://api.openai.com/v1/decisions', {
+      method: 'POST', headers: { Authorization: 'Bearer ' + env.OPENAI_API_KEY, 'Content-Type': 'application/json' },
+      body: payload, signal: AbortSignal.timeout(30000),
+    });
+    if (response.status !== 504 || attempt === 3) return response;
+    await response.arrayBuffer();
+    const delayMs = 2000 * 2 ** attempt;
+    const log = { event: 'decisions_retry', status: 504, retry: attempt + 1, delayMs };
+    if (response.headers.has('x-request-id')) log.requestId = response.headers.get('x-request-id');
+    console.warn(JSON.stringify(log));
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
+}
+
 export async function classify(env, context, images) {
   if (context.candidates.length === 0) return { target: 'NEW', requestId: 'no-candidates', confidence: 1 };
   const body = decisionRequest(context, images);
-  const response = await fetch('https://api.openai.com/v1/decisions', {
-    method: 'POST', headers: { Authorization: 'Bearer ' + env.OPENAI_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body), signal: AbortSignal.timeout(30000),
-  });
+  const response = await decisionResponse(env, body);
   const requestId = response.headers.get('x-request-id');
   if (typeof requestId !== 'string' || requestId.length === 0) throw new Error('Decisions HTTP ' + response.status + ': missing request ID');
   if (!response.ok) {
