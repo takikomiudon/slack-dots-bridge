@@ -3,12 +3,13 @@ import { createHmac } from 'node:crypto';
 import test from 'node:test';
 import { Miniflare, Response, convertV4MiniflareOptions } from 'miniflare';
 
-test('workerd routes a DM image and continuation, then returns native Slack blocks to the inbox', { timeout: 20000 }, async t => {
+test('workerd retries a classification 504 before posting a DM continuation exactly once', { timeout: 20000 }, async t => {
   const shared = Promise.withResolvers();
   const returned = Promise.withResolvers();
   const routed = Promise.withResolvers();
   const bytes = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
   const calls = [];
+  const decisionBodies = [];
   const blocks = [{ type: 'rich_text', elements: [{ type: 'rich_text_section', elements: [{ type: 'text', text: '画像を確認しました\n\n続きです' }] }] }];
   const mf = new Miniflare(convertV4MiniflareOptions({
     name: 'dm-edge-test',
@@ -41,7 +42,9 @@ test('workerd routes a DM image and continuation, then returns native Slack bloc
       }
       if (path === '/v1/decisions') {
         const body = await request.json();
+        decisionBodies.push(body);
         assert.ok(body.input[0].content.some(part => part.type === 'input_image'));
+        if (decisionBodies.length === 1) return new Response('Gateway Timeout', { status: 504 });
         return Response.json({ answers: [{ name: 'thread', type: 'choice', choice: '123.000001', confidence: 0.97 }] }, { headers: { 'x-request-id': 'req_edge' } });
       }
       assert.equal(path, '/api/chat.postMessage');
@@ -73,5 +76,7 @@ test('workerd routes a DM image and continuation, then returns native Slack bloc
   assert.deepEqual((await returned.promise).blocks, blocks);
   await send('dm-followup', { type: 'message', channel_type: 'im', channel: 'inbox', user: 'owner', ts: '124.000001', text: 'この画像の続きです' });
   assert.equal((await routed.promise).thread_ts, '123.000001');
-  assert.equal(calls.filter(path => path === '/v1/decisions').length, 1);
+  assert.equal(calls.filter(path => path === '/v1/decisions').length, 2);
+  assert.deepEqual(decisionBodies[0], decisionBodies[1]);
+  assert.equal(calls.filter(path => path === '/api/chat.postMessage').length, 2);
 });

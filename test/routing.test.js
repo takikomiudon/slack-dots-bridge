@@ -54,6 +54,65 @@ test('Decisions failures include status and request ID without leaking API respo
   });
 });
 
+test('headerless 504 responses retry the identical classification after 2, 4 and 8 seconds', async t => {
+  const requests = [];
+  const responses = [];
+  const delays = [];
+  const logs = [];
+  t.mock.method(globalThis, 'setTimeout', (resolve, delay) => { delays.push(delay); queueMicrotask(resolve); });
+  t.mock.method(console, 'warn', message => logs.push(JSON.parse(message)));
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    requests.push({ url, ...options });
+    if (requests.length <= 3) {
+      const response = new Response('<html>Gateway Timeout secret-body</html>', { status: 504 });
+      responses.push(response);
+      return response;
+    }
+    return Response.json({ answers: [{ type: 'choice', name: 'thread', choice: '123.001', confidence: 0.98 }] }, { headers: { 'x-request-id': 'req_recovered' } });
+  });
+  assert.equal((await classify({ OPENAI_API_KEY: 'secret' }, context, [])).requestId, 'req_recovered');
+  assert.deepEqual(delays, [2000, 4000, 8000]);
+  assert.equal(requests.length, 4);
+  assert.ok(requests.every(request => request.body === requests[0].body));
+  assert.ok(responses.every(response => response.bodyUsed));
+  assert.deepEqual(logs.map(log => [log.event, log.status, log.retry, log.delayMs]), [
+    ['decisions_retry', 504, 1, 2000], ['decisions_retry', 504, 2, 4000], ['decisions_retry', 504, 3, 8000],
+  ]);
+  assert.equal(JSON.stringify(logs).includes('secret'), false);
+});
+
+test('persistent 504 stops after four attempts and preserves the terminal error', async t => {
+  let calls = 0;
+  const delays = [];
+  t.mock.method(console, 'warn', () => {});
+  t.mock.method(globalThis, 'setTimeout', (resolve, delay) => { delays.push(delay); queueMicrotask(resolve); });
+  t.mock.method(globalThis, 'fetch', async () => { calls++; return new Response('timeout', { status: 504 }); });
+  await assert.rejects(() => classify({ OPENAI_API_KEY: 'secret' }, context, []), /Decisions HTTP 504: missing request ID/);
+  assert.equal(calls, 4);
+  assert.deepEqual(delays, [2000, 4000, 8000]);
+});
+
+test('non-504 HTTP failures do not retry', async t => {
+  t.mock.method(globalThis, 'setTimeout', () => assert.fail('Unexpected retry delay'));
+  for (const status of [400, 401, 429, 500, 503]) {
+    let calls = 0;
+    t.mock.method(globalThis, 'fetch', async () => {
+      calls++;
+      return Response.json({ error: { code: 'test_error' } }, { status, headers: { 'x-request-id': 'req_no_retry' } });
+    });
+    await assert.rejects(() => classify({ OPENAI_API_KEY: 'secret' }, context, []), new RegExp('Decisions HTTP ' + status));
+    assert.equal(calls, 1);
+  }
+});
+
+test('transport timeouts are not mistaken for an explicit HTTP 504', async t => {
+  let calls = 0;
+  t.mock.method(globalThis, 'setTimeout', () => assert.fail('Unexpected retry delay'));
+  t.mock.method(globalThis, 'fetch', async () => { calls++; throw new DOMException('Timed out', 'TimeoutError'); });
+  await assert.rejects(() => classify({ OPENAI_API_KEY: 'secret' }, context, []), { name: 'TimeoutError' });
+  assert.equal(calls, 1);
+});
+
 test('clarification uses native Slack buttons with exact job-specific values and pagination', () => {
   const choices = Array.from({ length: 12 }, (_, i) => ({ thread: '123.' + i, label: '会話' + i + '😀'.repeat(50) }));
   const menu = selectionMessage('selection-token', choices, 'どの予定のこと？', 1);
