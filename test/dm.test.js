@@ -21,7 +21,6 @@ function fixture(t) {
   const env = {
     SLACK_USER_TOKEN: 'user-token', SLACK_BOT_TOKEN: 'bot-token', SLACK_SIGNING_SECRET: 'signing-secret',
     SLACK_TEAM_ID: 'Tteam', SLACK_CHANNEL_ID: 'Cwork', SLACK_DM_CHANNEL_ID: 'Dinbox', SLACK_USER_ID: 'Uowner', DOTS_USER_ID: 'Udot', OPENAI_API_KEY: 'openai-key',
-    LINE_CHANNEL_SECRET: 'legacy', LINE_CHANNEL_ACCESS_TOKEN: 'legacy', LINE_ALLOWED_USER_ID: 'legacy',
   };
   const object = new BridgeObject(ctx, env);
   env.BRIDGE = { getByName(name) { assert.equal(name, 'personal'); return f.object; } };
@@ -194,4 +193,89 @@ test('LINE endpoint is retired and Slack signatures still reject stale or tamper
   assert.equal((await worker.fetch(signed(f.env, dm('stale'), '/slack', '1'), f.env)).status, 401);
   const request = signed(f.env, dm('tampered')); request.headers.set('x-slack-signature', 'v0=' + '0'.repeat(64));
   assert.equal((await worker.fetch(request, f.env)).status, 401);
+});
+
+function imageFixture(t) {
+  const f = fixture(t);
+  f.imageCalls = []; f.uploadCount = 0; f.imageMime = 'image/png';
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const path = new URL(url).pathname; f.imageCalls.push(path);
+    if (path.startsWith('/files-pri/')) return new Response(new Uint8Array([1, 2, 3]), { headers: { 'Content-Type': f.imageMime } });
+    if (path.startsWith('/upload/')) { assert.equal(options.redirect, 'manual'); assert.equal(Object.hasOwn(options.headers, 'Authorization'), false); return new Response(); }
+    if (path === '/v1/decisions') {
+      f.decisions.push(JSON.parse(options.body));
+      return Response.json({ answers: [{ type: 'choice', name: 'thread', choice: f.target, confidence: 0.9 }] }, { headers: { 'x-request-id': 'req_image' } });
+    }
+    if (path === '/api/files.info') {
+      const id = new URLSearchParams(options.body).get('file');
+      return Response.json({ ok: true, file: { id, name: id + '.png', mimetype: 'image/png', url_private_download: 'https://files.slack.com/files-pri/T-' + id + '/photo.png' } });
+    }
+    if (path === '/api/files.getUploadURLExternal') {
+      assert.equal(options.headers['Content-Type'], 'application/x-www-form-urlencoded');
+      assert.equal(new URLSearchParams(options.body).get('length'), '3');
+      f.uploadCount++;
+      return Response.json({ ok: true, file_id: 'Fcopy' + f.uploadCount, upload_url: 'https://files.slack.com/upload/' + f.uploadCount });
+    }
+    const body = JSON.parse(options.body); f.calls.push({ url, body, token: options.headers.Authorization });
+    if (path === '/api/files.completeUploadExternal') {
+      if (Object.hasOwn(f, 'beforeComplete')) await f.beforeComplete(body);
+      return Response.json({ ok: true, files: body.files });
+    }
+    assert.equal(path, '/api/chat.postMessage'); f.sequence++;
+    return Response.json({ ok: true, ts: '200.' + String(f.sequence).padStart(6, '0') });
+  });
+  return f;
+}
+
+function photoEvent(id) {
+  const event = dm(id, '');
+  event.event.files = [{ id: 'Fsource1' }, { id: 'Fsource2' }];
+  event.event.subtype = 'file_share';
+  return event;
+}
+
+function imageShare(id, thread = '300.000001') {
+  return { type: 'event_callback', team_id: 'Tteam', event_id: id, event: { type: 'message', user: 'Uowner', channel: 'Cwork', ts: thread, text: '<@Udot>', files: [{ id: 'Fcopy1' }, { id: 'Fcopy2' }] } };
+}
+
+test('multiple DM images use one decision and one channel parent without placeholder posts', async t => {
+  const f = imageFixture(t); const event = photoEvent('photos');
+  await worker.fetch(signed(f.env, event), f.env); await f.object.alarm();
+  assert.equal(f.decisions.length, 1);
+  assert.equal(f.decisions[0].input[0].content.filter(part => part.type === 'input_image').length, 1);
+  assert.equal(f.imageCalls.filter(path => path.startsWith('/files-pri/')).length, 2);
+  assert.deepEqual(f.calls[0].body, { files: [{ id: 'Fcopy1' }, { id: 'Fcopy2' }], channel_id: 'Cwork', initial_comment: '<@Udot>' });
+  await worker.fetch(signed(f.env, reply('early-photo-reply', '画像を確認しました', '300.000001')), f.env);
+  await f.object.alarm(); assert.equal(f.calls.length, 1);
+  await worker.fetch(signed(f.env, imageShare('share')), f.env); await f.object.alarm();
+  assert.equal(f.calls[1].body.channel, 'Dinbox');
+  assert.equal(f.db.prepare('SELECT thread FROM dm_messages WHERE ts = ?').get(event.event.ts).thread, '300.000001');
+  assert.equal(f.db.prepare("SELECT status FROM jobs WHERE id = 'dm:photos'").get().status, 'done');
+});
+
+test('image registration survives a share event arriving before the completion response', async t => {
+  const f = imageFixture(t);
+  f.beforeComplete = async () => { await worker.fetch(signed(f.env, imageShare('early-share')), f.env); };
+  await worker.fetch(signed(f.env, photoEvent('early-images')), f.env); await f.object.alarm();
+  assert.equal(f.db.prepare("SELECT status FROM jobs WHERE id = 'dm:early-images'").get().status, 'done');
+  assert.equal(f.db.prepare('SELECT COUNT(*) AS count FROM routing_image_jobs').get().count, 0);
+});
+
+test('DM text after an image cannot overtake the image thread registration', async t => {
+  const f = imageFixture(t);
+  await worker.fetch(signed(f.env, photoEvent('ordered-images')), f.env); await f.object.alarm();
+  await worker.fetch(signed(f.env, dm('after-photo', 'この画像の続き')), f.env); await f.object.alarm();
+  assert.equal(f.decisions.length, 1);
+  await worker.fetch(signed(f.env, imageShare('ordered-share')), f.env);
+  f.target = '300.000001'; await f.object.alarm();
+  assert.equal(f.decisions.length, 2); assert.equal(f.calls.at(-1).body.thread_ts, '300.000001');
+  assert.ok(f.decisions[1].input[0].content.some(part => part.type === 'input_image'));
+});
+
+test('invalid image content is persisted as a failure without uploading or guessing', async t => {
+  const f = imageFixture(t); f.imageMime = 'text/html';
+  await worker.fetch(signed(f.env, photoEvent('invalid-photo')), f.env);
+  await assert.rejects(() => f.object.alarm(), /Unsupported Slack image content type/);
+  assert.equal(f.uploadCount, 0); assert.equal(f.decisions.length, 0);
+  assert.equal(f.db.prepare("SELECT status FROM jobs WHERE id = 'dm:invalid-photo'").get().status, 'failed');
 });

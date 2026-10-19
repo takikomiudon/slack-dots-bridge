@@ -25,7 +25,7 @@ test('routing context uses only registered threads and preserves raw conversatio
   context.observe({ channel: 'private', user: 'dot', ts: '100.002', thread_ts: '100.001', text: '登録しました' });
   context.observe({ channel: 'private', user: 'owner', ts: '200.001', text: '登録していない別スレッド' });
   context.markImported('100.001');
-  context.recordLine('user-1', 'user', '', { text: '30分早めて' });
+  context.recordMessage('user-1', 'user', '', { text: '30分早めて' });
   const built = context.build('user-1', { text: '30分早めて' });
   assert.equal(built.context.candidates.length, 1);
   assert.equal(built.context.candidates[0].messages[0].text, '<映画> & 予定');
@@ -35,10 +35,10 @@ test('routing context uses only registered threads and preserves raw conversatio
 
 test('LINE delivery order is separate from Slack chronology and excludes later input', t => {
   const { context } = fixture(t);
-  context.recordLine('a', 'assistant', 'movie', { text: '映画の予定を登録しました' });
-  context.recordLine('b', 'assistant', 'essay', { text: 'ESを添削しました' });
-  context.recordLine('incoming', 'user', '', { text: 'それを直して' });
-  context.recordLine('future', 'assistant', 'movie', { text: '後から届いた映画の返答' });
+  context.recordMessage('a', 'assistant', 'movie', { text: '映画の予定を登録しました' });
+  context.recordMessage('b', 'assistant', 'essay', { text: 'ESを添削しました' });
+  context.recordMessage('incoming', 'user', '', { text: 'それを直して' });
+  context.recordMessage('future', 'assistant', 'movie', { text: '後から届いた映画の返答' });
   const { context: built } = context.build('incoming', { text: 'それを直して' });
   assert.deepEqual(built.lineHistory.map(x => x.thread), ['movie', 'essay']);
   assert.deepEqual(built.lineHistory.map(x => x.text), ['映画の予定を登録しました', 'ESを添削しました']);
@@ -47,7 +47,7 @@ test('LINE delivery order is separate from Slack chronology and excludes later i
 test('missing history import fails explicitly instead of classifying incomplete evidence', t => {
   const { sql, context } = fixture(t);
   sql.exec("INSERT INTO threads VALUES ('100.001')");
-  context.recordLine('incoming', 'user', '', { text: '続き' });
+  context.recordMessage('incoming', 'user', '', { text: '続き' });
   assert.throws(() => context.build('incoming', { text: '続き' }), /Conversation import incomplete.*100.001/);
 });
 
@@ -58,7 +58,7 @@ test('image context keeps private file references without storing image bytes', 
   const file = { id: 'Fimage', name: 'photo.jpg', mimetype: 'image/jpeg', url_private_download: 'https://files.slack.com/files-pri/T-F/download/photo.jpg' };
   context.observe({ channel: 'private', user: 'owner', ts: '100.001', text: '<@dot>', files: [{ id: 'Fimage' }] });
   context.recordFile(file);
-  context.recordLine('incoming', 'user', '', { text: 'この予定を変更して' });
+  context.recordMessage('incoming', 'user', '', { text: 'この予定を変更して' });
   const built = context.build('incoming', { text: 'この予定を変更して' });
   assert.deepEqual(built.context.candidates[0].messages[0].images, ['Fimage']);
   assert.equal(built.images[0].key, 'Fimage');

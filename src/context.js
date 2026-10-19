@@ -51,7 +51,7 @@ export class ConversationContext {
     this.sql.exec('INSERT OR IGNORE INTO routing_imports (thread) VALUES (?)', thread);
   }
 
-  recordLine(id, role, thread, content) {
+  recordMessage(id, role, thread, content) {
     this.sql.exec('INSERT OR IGNORE INTO routing_line (id, role, thread, content) VALUES (?, ?, ?, ?)', id, role, thread, JSON.stringify(content));
   }
 
@@ -67,7 +67,7 @@ export class ConversationContext {
     const missing = this.missingImports();
     if (missing.length > 0) throw new Error('Conversation import incomplete: ' + missing.map(row => row.thread).join(', '));
     const current = this.sql.exec('SELECT sequence FROM routing_line WHERE id = ?', id).toArray();
-    if (current.length !== 1) throw new Error('Missing LINE receive order: ' + id);
+    if (current.length !== 1) throw new Error('Missing inbox receive order: ' + id);
     const threads = this.sql.exec('SELECT thread FROM threads ORDER BY thread').toArray();
     const candidates = threads.map(row => ({ thread: row.thread, messages: [] }));
     const byThread = new Map(candidates.map(candidate => [candidate.thread, candidate]));

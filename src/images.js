@@ -4,7 +4,6 @@ const extensions = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif'
 export async function readImage(address, token, service) {
   const url = new URL(address);
   let valid = false;
-  if (service === 'LINE') valid = url.origin === 'https://api-data.line.me' && /^\/v2\/bot\/message\/\d+\/content$/.test(url.pathname);
   if (service === 'Slack') valid = url.origin === 'https://files.slack.com' && url.pathname.startsWith('/files-pri/');
   if (!valid || url.username !== '' || url.password !== '') throw new Error('Invalid ' + service + ' image URL');
   const response = await fetch(url.href, { headers: { Authorization: 'Bearer ' + token }, signal: AbortSignal.timeout(30000), redirect: 'manual' });

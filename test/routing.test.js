@@ -54,22 +54,21 @@ test('Decisions failures include status and request ID without leaking API respo
   });
 });
 
-test('clarification uses persistent buttons and exact job-specific postbacks with pagination', () => {
-  const choices = Array.from({ length: 12 }, (_, i) => ({ thread: '123.' + i, label: '会話' + i + '😀'.repeat(20) }));
+test('clarification uses native Slack buttons with exact job-specific values and pagination', () => {
+  const choices = Array.from({ length: 12 }, (_, i) => ({ thread: '123.' + i, label: '会話' + i + '😀'.repeat(50) }));
   const menu = selectionMessage('selection-token', choices, 'どの予定のこと？', 1);
-  assert.equal(menu.type, 'flex');
-  const buttons = menu.contents.body.contents.filter(x => x.type === 'button');
-  assert.ok(buttons.length <= 9);
+  const actionBlocks = menu.blocks.filter(block => block.type === 'actions');
+  const buttons = actionBlocks.flatMap(block => block.elements);
+  assert.ok(actionBlocks.every(block => block.elements.length <= 5));
   for (const button of buttons) {
-    assert.ok(button.action.label.length <= 20);
-    assert.equal(button.action.label.isWellFormed(), true);
-    assert.equal(new URLSearchParams(button.action.data).get('selection'), 'selection-token');
+    assert.ok(button.text.text.length <= 75);
+    assert.equal(button.text.text.isWellFormed(), true);
+    assert.equal(button.action_id, 'route');
+    assert.equal(new URLSearchParams(button.value).get('selection'), 'selection-token');
   }
-  const targets = buttons.map(x => new URLSearchParams(x.action.data).get('target'));
-  assert.ok(targets.includes('123.5'));
-  assert.ok(targets.includes('NEW'));
-  assert.ok(targets.includes('CANCEL'));
-  assert.ok(buttons.some(x => new URLSearchParams(x.action.data).get('page') === '0'));
-  assert.ok(buttons.some(x => new URLSearchParams(x.action.data).get('page') === '2'));
+  const targets = buttons.map(button => new URLSearchParams(button.value).get('target'));
+  assert.ok(targets.includes('123.5')); assert.ok(targets.includes('NEW')); assert.ok(targets.includes('CANCEL'));
+  assert.ok(buttons.some(button => new URLSearchParams(button.value).get('page') === '0'));
+  assert.ok(buttons.some(button => new URLSearchParams(button.value).get('page') === '2'));
   assert.throws(() => selectionMessage('token', choices, 'text', 99), /Invalid selection page/);
 });

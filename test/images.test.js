@@ -28,7 +28,7 @@ test('private image credentials cannot be sent to another origin or a redirected
   assert.equal(calls, 1);
 });
 
-test('new LINE image bytes can be reused for classification without downloading them twice', async t => {
+test('new inbox image bytes can be reused for classification without downloading them twice', async t => {
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected download'); });
   const images = await imageEvidence({}, [], [{ key: 'incoming', image: { bytes: new Uint8Array([1, 2, 3]), mime: 'image/jpeg' } }]);
   assert.equal(images[0].dataUrl, 'data:image/jpeg;base64,AQID');
